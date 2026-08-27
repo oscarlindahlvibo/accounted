@@ -5,6 +5,7 @@ import { requireCompanyId } from '@/lib/company/context'
 import { isStripeConfigured } from '@/lib/stripe/client'
 import { isSandboxCompany } from '@/lib/sandbox/guard'
 import { getTeamAgreement, type TeamAgreement } from '@/lib/entitlements/team-agreement'
+import { isSelfHosted } from '@/lib/env/public-flags'
 
 /**
  * Billing status for the client-rendered billing section (which lives inside the
@@ -20,6 +21,18 @@ import { getTeamAgreement, type TeamAgreement } from '@/lib/entitlements/team-ag
 export async function GET() {
   const { user, supabase, error } = await requireAuth()
   if (error) return error
+
+  // Self-hosted is all-on (mirrors lib/entitlements/has-capability.ts): no
+  // Stripe subscription or trial exists to report, so show "active" instead
+  // of leaking the SaaS trial/upgrade UI on a self-hosted instance.
+  if (isSelfHosted()) {
+    return NextResponse.json({
+      isPaying: true,
+      configured: isStripeConfigured(),
+      trialEndsAt: null,
+      isDemo: false,
+    })
+  }
 
   let companyId: string | null = null
   try {
