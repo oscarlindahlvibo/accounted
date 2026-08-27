@@ -1,0 +1,12 @@
+# Vibo override: build Accounted from our own fork (github.com/oscarlindahlvibo/accounted)
+# instead of pulling the public GHCR image, using our own extensions preset
+# (upstream's self-hosted set + enable-banking, for PSD2 bank sync).
+#
+# Usage: docker compose -f docker-compose.yml -f docker-compose.vibo.yml up -d --build
+services:
+  app:
+    image: !reset null
+    build:
+      context: .
+      args:
+        EXTENSIONS_PRESET: vibo
