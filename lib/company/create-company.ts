@@ -5,6 +5,7 @@ import { regenerateTaxDeadlinesForUser, toDeadlineSettings } from '@/lib/tax/dea
 import type { CompanySettingsForDeadlines } from '@/lib/tax/deadline-config'
 import type { CompanyLookupResult } from '@/lib/company-lookup/types'
 import type { EntityType } from '@/types'
+import { activateFullBasChart } from './activate-full-bas-chart'
 
 /**
  * The one company-creation sequence, shared by the web wizard (Server
@@ -146,6 +147,19 @@ export async function createCompanyCore(
   if (coaError) {
     await rollback('COA seeding failed', coaError)
     return { error: COMPANY_CREATION_ERRORS.chart_failed }
+  }
+
+  // 2b. Activate the full BAS Kontoplan (seed_chart_of_accounts only
+  // creates a curated ~35-account K1 starter set). Non-fatal: imports and
+  // categorization matching missing BAS numbers is worse than a slow step
+  // here, but a new company must not be rolled back over this alone.
+  try {
+    const { error: basError } = await activateFullBasChart(supabase, newCompanyId)
+    if (basError) {
+      console.warn("[createCompany] full BAS activation failed", basError)
+    }
+  } catch (err) {
+    console.warn("[createCompany] full BAS activation threw", err)
   }
 
   // 3. Save settings (strip UI-only and managed fields)
