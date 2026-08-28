@@ -15,6 +15,10 @@ import { Loader2, Lock, X } from 'lucide-react'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
 import type { CreateSupplierInput } from '@/types'
+import { useToast } from '@/components/ui/use-toast'
+import { CompanyLookupTrigger } from '@/components/company-lookup/CompanyLookupTrigger'
+import { applyLookupResult } from '@/lib/company-lookup/apply-lookup-result'
+import type { CompanyLookupResult } from '@/lib/company-lookup/types'
 
 interface SupplierFormProps {
   onSubmit: (data: CreateSupplierInput) => Promise<void>
@@ -28,6 +32,7 @@ export default function SupplierForm({
   initialData,
 }: SupplierFormProps) {
   const { canWrite } = useCanWrite()
+  const { toast } = useToast()
   const t = useTranslations('form_supplier')
   // Chart of accounts from the session cache (lib/reference-data): the
   // konto combobox is populated on the first paint; without the chart it
@@ -76,6 +81,9 @@ export default function SupplierForm({
     register,
     handleSubmit,
     control,
+    watch,
+    setValue,
+    getValues,
     formState: { errors },
   } = useForm<FormData>({
     resolver: zodResolver(schema),
@@ -102,6 +110,24 @@ export default function SupplierForm({
       notes: initialData?.notes || '',
     },
   })
+
+  const supplierType = watch('supplier_type')
+  const orgNumberValue = watch('org_number') ?? ''
+
+  function handleCompanyLookupApply(result: CompanyLookupResult) {
+    const { fields, skipped } = applyLookupResult(result, {
+      name: getValues('name'),
+      address_line1: getValues('address_line1'),
+      postal_code: getValues('postal_code'),
+      city: getValues('city'),
+    })
+    for (const [key, value] of Object.entries(fields)) {
+      setValue(key as keyof FormData, value, { shouldDirty: true, shouldValidate: true })
+    }
+    if (skipped.length > 0) {
+      toast({ title: t('company_lookup_partial_title') })
+    }
+  }
 
   // Empty strings go through as-is: the API schemas normalize them (dropped on
   // create, null on update so a cleared field actually clears the column).
@@ -175,11 +201,17 @@ export default function SupplierForm({
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-2">
             <Label htmlFor="org_number">{t('org_number_label')}</Label>
-            <Input
-              id="org_number"
-              placeholder={t('org_number_placeholder')}
-              {...register('org_number')}
-            />
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                id="org_number"
+                placeholder={t('org_number_placeholder')}
+                className="max-w-xs"
+                {...register('org_number')}
+              />
+              {supplierType === 'swedish_business' && (
+                <CompanyLookupTrigger orgNumber={orgNumberValue} onApply={handleCompanyLookupApply} />
+              )}
+            </div>
           </div>
           <div className="space-y-2">
             <Label htmlFor="vat_number">{t('vat_label')}</Label>

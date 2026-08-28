@@ -122,3 +122,28 @@ describe('fetchCompanyLookup', () => {
     expect(outcome).toEqual({ status: 'error' })
   })
 })
+
+describe('fetchCompanyLookup: no credentials reach the client', () => {
+  const fetchMock = vi.fn()
+
+  beforeEach(() => {
+    fetchMock.mockReset()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  it('never sends an Authorization header or any credential-like request init', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { data: LOOKUP }))
+    await fetchCompanyLookup('556677-8899', { ticEnabled: true })
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit | undefined]
+    expect(init?.headers).toBeUndefined()
+    expect(JSON.stringify(init ?? {})).not.toMatch(/authorization|bearer|client_secret|access_token/i)
+  })
+
+  it("only ever calls Accounted's own /api/ routes, never a third-party host", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { data: LOOKUP }))
+    await fetchCompanyLookup('556677-8899', { ticEnabled: true })
+    const url = String(fetchMock.mock.calls[0][0])
+    expect(url.startsWith('/api/')).toBe(true)
+  })
+})

@@ -27,6 +27,9 @@ import {
 } from '@/lib/customers/mask-personal-number'
 import { looksLikeSwedishPersonalNumber } from '@/lib/customers/personal-number-shape'
 import type { CreateCustomerInput } from '@/types'
+import { CompanyLookupTrigger } from '@/components/company-lookup/CompanyLookupTrigger'
+import { applyLookupResult } from '@/lib/company-lookup/apply-lookup-result'
+import type { CompanyLookupResult } from '@/lib/company-lookup/types'
 
 interface CustomerFormProps {
   onSubmit: (data: CreateCustomerInput) => Promise<void>
@@ -122,6 +125,8 @@ export default function CustomerForm({
     handleSubmit,
     watch,
     control,
+    setValue,
+    getValues,
     formState: { errors },
   } = useForm<FormData>({
     resolver: zodResolver(schema),
@@ -147,7 +152,23 @@ export default function CustomerForm({
     },
   })
 
+  function handleCompanyLookupApply(result: CompanyLookupResult) {
+    const { fields, skipped } = applyLookupResult(result, {
+      name: getValues('name'),
+      address_line1: getValues('address_line1'),
+      postal_code: getValues('postal_code'),
+      city: getValues('city'),
+    })
+    for (const [key, value] of Object.entries(fields)) {
+      setValue(key as keyof FormData, value, { shouldDirty: true, shouldValidate: true })
+    }
+    if (skipped.length > 0) {
+      toast({ title: t('company_lookup_partial_title') })
+    }
+  }
+
   const customerType = watch('customer_type')
+  const orgNumberValue = watch('org_number') ?? ''
   const vatNumber = watch('vat_number')
   // The stored value could not be decrypted. The field is editable (typing a
   // fresh personnummer replaces it); say so, because the placeholder on its own
@@ -426,11 +447,17 @@ export default function CustomerForm({
 
           <div className="space-y-2">
             <Label htmlFor="org_number">{t('org_number_label')}</Label>
-            <Input
-              id="org_number"
-              placeholder={t('org_number_placeholder')}
-              {...register('org_number')}
-            />
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                id="org_number"
+                placeholder={t('org_number_placeholder')}
+                className="max-w-xs"
+                {...register('org_number')}
+              />
+              {customerType === 'swedish_business' && (
+                <CompanyLookupTrigger orgNumber={orgNumberValue} onApply={handleCompanyLookupApply} />
+              )}
+            </div>
             {errors.org_number && (
               <p className="text-sm text-destructive">{errors.org_number.message}</p>
             )}
