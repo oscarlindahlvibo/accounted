@@ -56,6 +56,20 @@ describe('mapBolagsverketToCompanyLookupResult', () => {
     expect(result.isCeased).toBe(true)
   })
 
+  it('filters out blank SNI entries the API sometimes returns alongside real ones', async () => {
+    const { mapBolagsverketToCompanyLookupResult } = await import('../organisation')
+    const result = mapBolagsverketToCompanyLookupResult({
+      ...AKTIEBOLAG,
+      naringsgrenOrganisation: {
+        sni: [
+          { kod: '46699', klartext: 'Partihandel' },
+          { kod: '   ', klartext: '' },
+        ],
+      },
+    })
+    expect(result.sniCodes).toEqual([{ code: '46699', name: 'Partihandel' }])
+  })
+
   it('handles a company with no name list at all', async () => {
     const { mapBolagsverketToCompanyLookupResult } = await import('../organisation')
     const result = mapBolagsverketToCompanyLookupResult({ ...AKTIEBOLAG, organisationsnamn: {} })

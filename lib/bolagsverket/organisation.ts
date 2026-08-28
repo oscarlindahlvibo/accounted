@@ -98,7 +98,12 @@ export function mapBolagsverketToCompanyLookupResult(org: BvOrganisation): Compa
     bankAccounts: [],
     email: null,
     phone: null,
-    sniCodes: sni.map((s) => ({ code: s.kod, name: s.klartext })),
+    // The API (verified against real acceptance test data) can include
+    // blank sni entries alongside real ones; drop anything without an
+    // actual code rather than surfacing empty rows in the UI.
+    sniCodes: sni
+      .filter((s) => s.kod?.trim())
+      .map((s) => ({ code: s.kod.trim(), name: (s.klartext ?? '').trim() })),
     fiscalYear: null,
     legalEntityType: org.organisationsform?.kod ?? null,
     registrationDate: org.organisationsdatum?.registreringsdatum

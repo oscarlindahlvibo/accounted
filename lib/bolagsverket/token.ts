@@ -39,10 +39,16 @@ interface TokenResponse {
 async function mintToken(): Promise<string> {
   const config = getBolagsverketConfig()
 
+  // WSO2 does NOT default to the app's full subscribed scope set when scope
+  // is omitted (verified 2026-08-27 against acceptance: an unscoped token
+  // mint 403'd on both /isalive and /organisationer with "Scope validation
+  // failed"). Both scopes are requested in one token so a single cached
+  // token serves every operation this integration calls.
   const body = new URLSearchParams({
     grant_type: 'client_credentials',
     client_id: config.clientId,
     client_secret: config.clientSecret,
+    scope: 'vardefulla-datamangder:read vardefulla-datamangder:ping',
   })
 
   let response: Response
