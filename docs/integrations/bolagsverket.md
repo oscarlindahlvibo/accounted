@@ -158,6 +158,34 @@ matters most for financial figures: never invent a number. The document
 list and raw document retrieval are ready; figure extraction is a
 follow-up once there's a concrete need and a taxonomy-mapping plan.
 
+## Verified live (acceptance, 2026-08-27)
+
+Tested end-to-end against real acceptance credentials and Bolagsverket's
+own published test dataset ("Testdata API Vardefulla datamangder.xlsx",
+downloaded from the devportal's Documentation tab for this API):
+
+- **Test connection**: pass (token + `/isalive`).
+- **Organisation lookup**: pass, using test org `5560021361` ("Testbolag 4
+  bokat av SKV Aktiebolag") -- name, address, SNI, org form, registration
+  date all mapped correctly.
+- **Annual report list** (`/dokumentlista`, test org `5561890038`): the
+  request is correct and reaches Bolagsverket, but their own test document
+  backend (`vardefulla-datamangder-producent-dokument-accept2`) returned a
+  500 Internal Server Error. This is on Bolagsverket's side in their test
+  environment, not a bug here -- the client classified and retried it
+  correctly. Worth re-testing later; not blocking.
+
+Two real bugs this live test caught and fixed:
+
+- **Token scope**: WSO2 does not grant a client's full subscribed scope set
+  when the token request omits `scope` -- an unscoped token 403'd on both
+  `/isalive` and `/organisationer` ("Scope validation failed") despite a
+  successful 200 from the token endpoint. Fixed by requesting both scopes
+  explicitly in every mint.
+- **Blank SNI entries**: `naringsgrenOrganisation.sni` can contain blank
+  entries alongside real ones (confirmed on the same test org). Filtered
+  out in the mapper rather than surfaced as empty rows in the UI.
+
 ## Known limitations / TODO
 
 - Customers/suppliers lookup UI not wired (backend ready, see above).
