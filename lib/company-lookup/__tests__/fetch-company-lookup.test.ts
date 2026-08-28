@@ -17,11 +17,11 @@ const LOOKUP: CompanyLookupResult = {
 }
 
 function jsonResponse(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 }
+
+const BOLAGSVERKET_URL = '/api/company-lookup/bolagsverket?org_number=';
+const TIC_URL = '/api/extensions/ext/tic/lookup?org_number=';
 
 describe('fetchCompanyLookup', () => {
   const fetchMock = vi.fn()
@@ -31,102 +31,94 @@ describe('fetchCompanyLookup', () => {
     vi.stubGlobal('fetch', fetchMock)
   })
 
-  it('returns disabled without fetching when tic is not enabled', async () => {
-    const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: false })
-    expect(outcome).toEqual({ status: 'disabled' })
-    expect(fetchMock).not.toHaveBeenCalled()
-  })
-
   it('returns disabled without fetching for a malformed orgnr', async () => {
     const outcome = await fetchCompanyLookup('12', { ticEnabled: true })
     expect(outcome).toEqual({ status: 'disabled' })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('returns the lookup result on 200', async () => {
+  it('returns a Bolagsverket result on 200 without ever calling TIC', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { data: LOOKUP }))
     const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
     expect(outcome).toEqual({ status: 'found', result: LOOKUP })
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(String(fetchMock.mock.calls[0][0])).toContain(
-      '/api/extensions/ext/tic/lookup?org_number=',
-    )
+    expect(String(fetchMock.mock.calls[0][0])).toContain(BOLAGSVERKET_URL)
   })
 
-  it("maps the TIC handler's 404 (Company not found) to not_found", async () => {
+  it("maps Bolagsverket's 404 (Company not found) to not_found without trying TIC", async () => {
     fetchMock.mockResolvedValue(jsonResponse(404, { error: 'Company not found' }))
     const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
     expect(outcome).toEqual({ status: 'not_found' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
-  it("maps the dispatcher's 404 (Extension not found) to disabled, not not_found", async () => {
-    fetchMock.mockResolvedValue(jsonResponse(404, { error: 'Extension not found' }))
+  it('falls back to TIC when Bolagsverket is unconfigured (503 NOT_CONFIGURED)', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      url.includes('/company-lookup/bolagsverket')
+        ? jsonResponse(503, { code: 'NOT_CONFIGURED' })
+        : jsonResponse(200, { data: LOOKUP }),
+    )
     const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
-    expect(outcome).toEqual({ status: 'disabled' })
+    expect(outcome).toEqual({ status: 'found', result: LOOKUP })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(String(fetchMock.mock.calls[1][0])).toContain(TIC_URL)
   })
 
-  it('maps a legacy 403 to disabled', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(403, { error: 'Extension disabled' }))
+  it('falls back to TIC when Bolagsverket errors transiently (429/5xx/network)', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      url.includes('/company-lookup/bolagsverket')
+        ? jsonResponse(429, { error: 'Rate limit exceeded' })
+        : jsonResponse(200, { data: LOOKUP }),
+    )
     const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
-    expect(outcome).toEqual({ status: 'disabled' })
+    expect(outcome).toEqual({ status: 'found', result: LOOKUP })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  it('maps a feature-flag 503 (EXTENSION_DISABLED) to disabled', async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse(503, { error: 'Not in this environment', code: 'EXTENSION_DISABLED' }),
+  it('does not try TIC when ticEnabled is false, even if Bolagsverket is unconfigured', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(503, { code: 'NOT_CONFIGURED' }))
+    const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: false })
+    expect(outcome).toEqual({ status: 'disabled' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces error (not disabled) when neither provider is enabled and Bolagsverket fails transiently', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(500, { error: 'boom' }))
+    const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: false })
+    expect(outcome).toEqual({ status: 'error' })
+  })
+
+  it("maps the TIC dispatcher's 404 (Extension not found) to disabled on fallback", async () => {
+    fetchMock.mockImplementation((url: string) =>
+      url.includes('/company-lookup/bolagsverket')
+        ? jsonResponse(503, { code: 'NOT_CONFIGURED' })
+        : jsonResponse(404, { error: 'Extension not found' }),
     )
     const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
     expect(outcome).toEqual({ status: 'disabled' })
   })
 
-  it('maps NOT_CONFIGURED 503 to error (advisory note, manual path)', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(503, { error: 'TIC is not configured' }))
+  it('maps a network failure on Bolagsverket, then a TIC success, to found', async () => {
+    fetchMock.mockImplementation((url: string) =>
+      url.includes('/company-lookup/bolagsverket')
+        ? Promise.reject(new TypeError('Failed to fetch'))
+        : Promise.resolve(jsonResponse(200, { data: LOOKUP })),
+    )
     const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
-    expect(outcome).toEqual({ status: 'error' })
+    expect(outcome).toEqual({ status: 'found', result: LOOKUP })
   })
 
-  it('maps 429 rate limit and 504 timeout to error', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(429, { error: 'Rate limit exceeded' }))
-    expect(await fetchCompanyLookup('556677-8899', { ticEnabled: true })).toEqual({
-      status: 'error',
-    })
-    fetchMock.mockResolvedValue(jsonResponse(504, { error: 'Timeout' }))
-    expect(await fetchCompanyLookup('556677-8899', { ticEnabled: true })).toEqual({
-      status: 'error',
-    })
-  })
-
-  it('maps a network failure to error without throwing', async () => {
-    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
-    const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
-    expect(outcome).toEqual({ status: 'error' })
-  })
-
-  it('maps an abort to aborted', async () => {
+  it('maps an abort on the first (Bolagsverket) call to aborted without trying TIC', async () => {
     const abortError = new DOMException('Aborted', 'AbortError')
     fetchMock.mockRejectedValue(abortError)
     const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
     expect(outcome).toEqual({ status: 'aborted' })
-  })
-
-  it('returns aborted when the signal fired during the response', async () => {
-    const controller = new AbortController()
-    fetchMock.mockImplementation(async () => {
-      controller.abort()
-      return jsonResponse(200, { data: LOOKUP })
-    })
-    const outcome = await fetchCompanyLookup('556677-8899', {
-      ticEnabled: true,
-      signal: controller.signal,
-    })
-    expect(outcome).toEqual({ status: 'aborted' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('maps a malformed success body to error', async () => {
-    fetchMock.mockResolvedValue(
-      new Response('not json', { status: 200, headers: { 'Content-Type': 'text/html' } }),
-    )
-    const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: true })
+    fetchMock.mockResolvedValue(new Response('not json', { status: 200, headers: { 'Content-Type': 'text/html' } }))
+    const outcome = await fetchCompanyLookup('556677-8899', { ticEnabled: false })
     expect(outcome).toEqual({ status: 'error' })
   })
 })

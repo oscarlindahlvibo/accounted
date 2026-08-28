@@ -30,7 +30,15 @@ export interface CompanyLookupResult {
   companyName: string
   isCeased: boolean
   address: { street: string | null; postalCode: string | null; city: string | null } | null
-  registration: { fTax: boolean; vat: boolean }
+  /**
+   * F-tax / VAT registration flags. `null` means the provider does not
+   * report this field at all (e.g. Bolagsverket's VärdefullaDatamängder API
+   * has no F-skatt/moms data), as distinct from `false` (provider
+   * confirmed: not registered). Consumers that persist these into a
+   * required boolean column must decide the null case explicitly rather
+   * than let it silently become false.
+   */
+  registration: { fTax: boolean | null; vat: boolean | null }
   bankAccounts: { type: string; accountNumber: string; bic: string | null }[]
   email: string | null
   phone: string | null

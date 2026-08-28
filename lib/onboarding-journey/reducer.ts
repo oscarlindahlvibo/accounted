@@ -273,7 +273,7 @@ export function journeyReducer(state: JourneyState, action: JourneyAction): Jour
           address_line1: lookup.address?.street ?? state.settings.address_line1,
           postal_code: lookup.address?.postalCode ?? state.settings.postal_code,
           city: lookup.address?.city ?? state.settings.city,
-          f_skatt: lookup.registration.fTax,
+          f_skatt: lookup.registration.fTax ?? state.settings.f_skatt,
         }
         const enriched = stay(cleared, {
           settings,
