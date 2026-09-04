@@ -80,9 +80,18 @@ function currentName(org: BvOrganisation): string {
 export function mapBolagsverketToCompanyLookupResult(org: BvOrganisation): CompanyLookupResult {
   const address = org.postadressOrganisation?.postadress
   const sni = org.naringsgrenOrganisation?.sni ?? []
-  const isCeased =
-    Boolean(org.avregistreradOrganisation?.avregistreringsdatum) ||
-    org.verksamOrganisation?.kod === 'NEJ'
+  // isCeased relies ONLY on Bolagsverket's own avregistreringsdatum, never
+  // on SCB's verksamOrganisation.kod. Confirmed against real production
+  // data (802511-1959, an active ideell forening not registered at
+  // Bolagsverket at all -- every Bolagsverket-sourced field, including
+  // avregistreradOrganisation, errors with ORGANISATION_FINNS_EJ, which is
+  // correctly not-ceased): SCB's "aktiv" flag reads NEJ for this real,
+  // existing association, so treating it as a ceased-signal produced a
+  // false "Avregistrerad" for an organisation that simply isn't the kind
+  // Bolagsverket tracks. avregistreringsdatum is the one field that only
+  // gets a real value when Bolagsverket has actually recorded a
+  // deregistration; anything else is a guess.
+  const isCeased = Boolean(org.avregistreradOrganisation?.avregistreringsdatum)
 
   return {
     companyName: currentName(org),

@@ -50,9 +50,28 @@ describe('mapBolagsverketToCompanyLookupResult', () => {
     expect(result.isCeased).toBe(true)
   })
 
-  it('treats verksamOrganisation.kod === NEJ as ceased even without an avregistrering date', async () => {
+  it('does NOT treat verksamOrganisation.kod === NEJ alone as ceased (SCB false positive for entities Bolagsverket does not register)', async () => {
+    // Regression: 802511-1959, a real, existing ideell forening. Every
+    // Bolagsverket-sourced field errors with ORGANISATION_FINNS_EJ (not
+    // registered there at all -- expected for this entity type), but SCB
+    // still reports verksamOrganisation.kod = 'NEJ'. That used to be read
+    // as "ceased" and showed a real association as "Avregistrerad".
     const { mapBolagsverketToCompanyLookupResult } = await import('../organisation')
-    const result = mapBolagsverketToCompanyLookupResult({ ...AKTIEBOLAG, verksamOrganisation: { kod: 'NEJ' } })
+    const result = mapBolagsverketToCompanyLookupResult({
+      ...AKTIEBOLAG,
+      avregistreradOrganisation: undefined,
+      verksamOrganisation: { kod: 'NEJ', dataproducent: 'SCB' },
+    })
+    expect(result.isCeased).toBe(false)
+  })
+
+  it('treats a real avregistreringsdatum as ceased, regardless of verksamOrganisation', async () => {
+    const { mapBolagsverketToCompanyLookupResult } = await import('../organisation')
+    const result = mapBolagsverketToCompanyLookupResult({
+      ...AKTIEBOLAG,
+      avregistreradOrganisation: { avregistreringsdatum: '2023-05-05T00:00:00.000+00:00' },
+      verksamOrganisation: { kod: 'JA', dataproducent: 'SCB' },
+    })
     expect(result.isCeased).toBe(true)
   })
 
