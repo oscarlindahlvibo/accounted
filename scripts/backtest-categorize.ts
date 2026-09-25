@@ -13,6 +13,22 @@
  *   npx tsx scripts/backtest-categorize.ts [N]
  *   rm .env.local
  *
+ * Scope: this script does NOT run on live customer books. It reads each
+ * transaction's description, merchant name and matched underlag (via
+ * gatherUnderlag) and sends all of it back through the model, which is
+ * identifiable bookkeeping content, not anonymous telemetry. The anonymised
+ * statistical data the customer agreement covers does not stretch to that,
+ * and the DPA limits us to the controller's documented instructions.
+ *
+ * So the corpus is, by default, sandbox companies (seed data we own). To run
+ * against a real company you must name it explicitly:
+ *
+ *   BACKTEST_COMPANY_IDS=<uuid>,<uuid> npx tsx scripts/backtest-categorize.ts
+ *
+ * Only name a company that has a written agreement covering evaluation runs.
+ * The env var is the record that someone made that call deliberately; an
+ * unset run can never touch a customer's books.
+ *
  * Leakage caveat: a known vendor's counterparty template may already reflect
  * the very booking under test, inflating the "deterministic nailed it" segment.
  * The "model had to decide" segment below is the leakage-free measure.
@@ -26,26 +42,75 @@ const CONCURRENCY = 4
 async function main() {
   const { createClient } = await import('@supabase/supabase-js')
   // Import after dotenv so lib/ai resolves the provider/model from .env.local.
-  const { gatherCandidates } = await import('../lib/agent/categorize/candidates')
-  const { gatherUnderlag } = await import('../lib/agent/categorize/underlag')
-  const { selectAccount } = await import('../lib/agent/categorize/select-account')
+  const { gatherCandidates } = await import('../src/lib/agent/categorize/candidates')
+  const { gatherUnderlag } = await import('../src/lib/agent/categorize/underlag')
+  const { selectAccount } = await import('../src/lib/agent/categorize/select-account')
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY!
   const supabase = createClient(url, key)
 
-  // Recent booked expense transactions with a counterparty.
-  const { data: txs, error } = await supabase
-    .from('transactions')
-    .select('id, company_id, merchant_name, description, original_description, amount, date, currency, document_id, journal_entry_id')
-    .not('journal_entry_id', 'is', null)
-    .lt('amount', 0)
-    .eq('is_business', true)
-    .not('merchant_name', 'is', null)
-    .order('created_at', { ascending: false })
-    .limit(N)
-  if (error) throw error
-  const rows = txs ?? []
+  // Named companies (written agreement required) or, by default, our own
+  // sandbox seed data. Never the whole fleet.
+  const named = (process.env.BACKTEST_COMPANY_IDS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  let companyIds: string[]
+  if (named.length > 0) {
+    companyIds = named
+    console.log(`Backtesting ${named.length} explicitly named company(ies). Each must be covered by a written agreement.`)
+  } else {
+    const { data: sandboxes, error: sandboxError } = await supabase
+      .from('company_settings')
+      .select('company_id')
+      .eq('is_sandbox', true)
+    if (sandboxError) throw sandboxError
+    companyIds = (sandboxes ?? []).map((r) => r.company_id as string)
+    console.log(`No BACKTEST_COMPANY_IDS set: backtesting ${companyIds.length} sandbox company(ies).`)
+  }
+  if (companyIds.length === 0) {
+    console.log('\nNothing to backtest. Set BACKTEST_COMPANY_IDS to a company covered by a written agreement, or seed a sandbox company.')
+    return
+  }
+
+  // Recent booked expense transactions with a counterparty. Queried per chunk
+  // of company ids (`.in()` lives in the GET query string), then merged and
+  // re-cut to the N most recent overall.
+  const CHUNK = 100
+  const chunks: string[][] = []
+  for (let i = 0; i < companyIds.length; i += CHUNK) chunks.push(companyIds.slice(i, i + CHUNK))
+  type Tx = {
+    id: string
+    company_id: string
+    merchant_name: string | null
+    description: string | null
+    original_description: string | null
+    amount: number
+    date: string
+    currency: string | null
+    document_id: string | null
+    journal_entry_id: string | null
+    created_at: string
+  }
+  const candidatesByChunk: Tx[] = []
+  for (const chunk of chunks) {
+    const { data: txs, error } = await supabase
+      .from('transactions')
+      .select('id, company_id, merchant_name, description, original_description, amount, date, currency, document_id, journal_entry_id, created_at')
+      .in('company_id', chunk)
+      .not('journal_entry_id', 'is', null)
+      .lt('amount', 0)
+      .eq('is_business', true)
+      .not('merchant_name', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(N)
+    if (error) throw error
+    candidatesByChunk.push(...((txs ?? []) as Tx[]))
+  }
+  const rows = candidatesByChunk
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
+    .slice(0, N)
   console.log(`\nBacktesting ${rows.length} booked transactions on ${process.env.BEDROCK_MODEL_ID ?? process.env.AI_MODEL ?? 'the configured model'}…\n`)
 
   // Ground-truth debit account per journal entry (expense line, not cash/VAT).
@@ -101,7 +166,7 @@ async function main() {
     const sel = await selectAccount({
       transaction: {
         merchantName: r.merchant_name,
-        description: r.description,
+        description: r.description ?? r.original_description ?? '',
         amount: r.amount,
         date: r.date,
         currency: r.currency,

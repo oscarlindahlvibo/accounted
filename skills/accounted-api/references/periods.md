@@ -12,32 +12,86 @@ are in SKILL.md and are not repeated per endpoint.
 **List chart-of-accounts entries (BAS chart).**
 `scope:reports:read · risk:low · idempotent`
 
-Returns every account in the company's chart of accounts, ordered by sort_order (the BAS canonical sequence). Filter by ?class=<1..8> (BAS account class: 1=assets, 2=equity/liabilities, 3=revenue, 4=cost of goods sold, 5=övriga externa kostnader (rents, supplies, services), 6=övriga externa kostnader (marketing, professional services, IT), 7=labour, 8=financial). Note: BAS 5xxx and 6xxx are both övriga externa kostnader but cover distinct subgroups; see the BAS chart for the canonical mapping. Pass ?active=false to include archived accounts.
+Returns the company's own chart of accounts (kontoplan), ordered by account_number, which is the BAS sequence (a longer sub-account number such as 19301 sorts directly after 1930). This is not the full BAS 2026 catalogue: a new company starts with a small set of accounts seeded for its company form, and standard BAS accounts join the chart when the user activates them, when an import brings them in, or automatically the first time a verifikat posts to one. Filter with ?class=<0-9>, the first digit of account_number: 1 assets; 2 equity, untaxed reserves and liabilities; 3 operating revenue; 4 goods, materials and subcontracted services; 5 external expenses for premises, leasing, energy, consumables, repairs, vehicles, freight, travel, and advertising and PR; 6 other external expenses such as selling costs, office supplies, telecom, insurance, administration, accounting, IT and consulting services, and hired staff; 7 personnel costs, plus write-downs and depreciation (77xx-78xx); 8 financial items, year-end appropriations (88xx), and tax and the year's result (89xx). Classes 0 and 9 are outside BAS's 1-8 (free for company use) and appear only on internal accounts, typically carried over from an imported chart. Only active accounts are returned by default; pass ?active=false to include deactivated ones.
 
-**Use when:** You need account numbers and names to render verifikation tables, build a custom report, or look up the canonical BAS label for an account.
-**Do not use for:** Fetching balances: use the trial-balance report. Creating new accounts: this endpoint is read-only in v1 (use the dashboard).
+**Use when:** You need account numbers and names to render verifikation tables, build a custom report, check that an account is active before booking to it, or look up an account's type, normal balance, SRU code or VAT defaults.
+**Do not use for:** Fetching balances: use the trial-balance report. Creating, renaming or deactivating accounts: v1 has no account write endpoint. Use the Kontoplan (chart of accounts) page in the app, or the MCP tools accounted_create_account and accounted_update_account, which stage the change for approval.
 
 **Pitfalls:**
-- account_number is a STRING: "1930", not 1930. The leading character can be 0 in non-BAS plans.
-- is_system_account=true means the account was seeded by Accounted and cannot be archived or renamed.
-- Default filter excludes archived accounts; pass ?active=false to include them.
+- account_number is a STRING: "1930", not 1930. BAS numbers have four digits; a chart imported from another system can also carry longer sub-account numbers such as "19301".
+- An account missing from this list is not necessarily unusable. Posting to a standard BAS 2026 account that is not in the chart adds it automatically; posting to a deactivated account, or to a non-BAS number the chart does not contain, fails with ACCOUNTS_NOT_IN_CHART.
+- is_system_account=true marks the accounts seeded when the company was created (such as 1510, 1930, 2440, 2611 and 3001). They cannot be deleted and bulk deactivation skips them, but they can still be renamed and deactivated one at a time.
+- normal_balance belongs to the account, not to account_type: contra accounts go against their type, such as 1219 (accumulated depreciation, an asset with a credit balance) and 3730 (discounts given, revenue with a debit balance).
+- default_vat_rate is a fraction (0, 0.06, 0.12 or 0.25), not a percentage. default_vat_treatment overrides the built-in BAS mapping for the momsdeklaration and is null unless someone set it; it can only be set on class 3 (sales treatments) and classes 4-6 (reverse-charge purchase treatments).
+- sort_order is a stored display hint, not a sequence to rely on: every account seeded at company creation carries 0. The list already comes in BAS order.
+- Deactivated accounts are excluded by default; pass ?active=false to include them. A deactivated account keeps its history and balances but cannot be used on new verifikat.
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `class` | query | `string` | no | Account class, the first digit of account_number (0-9). BAS uses 1-8; 0 and 9 appear only on internal accounts, typically carried over from an imported chart. |
+| `active` | query | `"true" \| "false"` | no | false also returns deactivated accounts. Default: active accounts only. |
 
 Response `200`:
 ```ts
 {
   data: {
-    accounts: { account_number: string, account_name: string, account_class: number, account_group: string, account_type: string, normal_balance: string, is_system_account: boolean, is_active: boolean, description: string, default_vat_code: string, default_vat_rate: number, default_vat_treatment: string, sru_code: string, sort_order: number }[]
+    accounts: { account_number: string, account_name: string, account_class: number, account_group: string, account_type: "asset" | "equity" | "liability" | "untaxed_reserves" | "revenue" | "expense", normal_balance: "debit" | "credit", is_system_account: boolean, is_active: boolean, description: string | null, default_vat_code: string | null, default_vat_rate: number | null, default_vat_treatment: "standard_25" | "reduced_12" | "reduced_6" | "exempt" | "reverse_charge_domestic" | "reverse_charge_eu_goods" | "reverse_charge_eu_services" | "reverse_charge_non_eu_services" | "export_goods" | "export_services" | "vmb" | "rental_voluntary" | "oss" | "triangulation_eu_goods" | "own_use" | "import_goods" | null, sru_code: string | null, sort_order: number | null }[]
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "accounts": [
+      {
+        "account_number": "1930",
+        "account_name": "Företagskonto / checkkonto",
+        "account_class": 1,
+        "account_group": "19",
+        "account_type": "asset",
+        "normal_balance": "debit",
+        "is_system_account": true,
+        "is_active": true,
+        "description": null,
+        "default_vat_code": null,
+        "default_vat_rate": null,
+        "default_vat_treatment": null,
+        "sru_code": "7281",
+        "sort_order": 0
+      },
+      {
+        "account_number": "3001",
+        "account_name": "Försäljning inom Sverige, 25 % moms",
+        "account_class": 3,
+        "account_group": "30",
+        "account_type": "revenue",
+        "normal_balance": "credit",
+        "is_system_account": true,
+        "is_active": true,
+        "description": null,
+        "default_vat_code": null,
+        "default_vat_rate": 0.25,
+        "default_vat_treatment": null,
+        "sru_code": "7410",
+        "sort_order": 0
+      }
+    ]
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -63,6 +117,8 @@ Generalised pre-flight that consolidates the Accounted pre-close validators unde
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `type` | query | `"year_end_readiness" \| "voucher_gaps"` | yes | Which check to run. |
+| `fiscal_period_id` | query | `string` | yes | Fiscal period to check (id from GET /fiscal-periods). Both current check types require it. |
 
 Response `200`:
 ```ts
@@ -78,9 +134,40 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "type": "year_end_readiness",
+    "ready": false,
+    "findings": [
+      {
+        "severity": "blocker",
+        "code": "YEAR_END_DRAFTS_PRESENT",
+        "message": "3 draft journal entries must be committed or cancelled before year-end.",
+        "details": {
+          "draft_count": 3
+        }
+      }
+    ],
+    "summary": "Period is NOT ready (1 blocker(s)).",
+    "generated_at": "2026-05-12T14:00:00Z",
+    "params": {
+      "fiscal_period_id": "a8f1…"
+    }
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -111,14 +198,49 @@ Response `200`:
 ```ts
 {
   data: {
-    dimensions: { id: string, sie_dim_no: number, name: string, resets_annually: boolean, is_system: boolean, is_active: boolean, sort_order: number, values: { id: string, code: string, name: string, is_active: boolean, start_date: string, end_date: string }[] }[]
+    dimensions: { id: string, sie_dim_no: number, name: string, resets_annually: boolean, is_system: boolean, is_active: boolean, sort_order: number, values: { id: string, code: string, name: string, is_active: boolean, start_date: string | null, end_date: string | null }[] }[]
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "dimensions": [
+      {
+        "id": "0e9c…",
+        "sie_dim_no": 1,
+        "name": "Kostnadsställe",
+        "resets_annually": true,
+        "is_system": true,
+        "is_active": true,
+        "sort_order": 10,
+        "values": [
+          {
+            "id": "a8f1…",
+            "code": "BUTIK",
+            "name": "Butiken",
+            "is_active": true,
+            "start_date": null,
+            "end_date": null
+          }
+        ]
+      }
+    ]
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -145,31 +267,68 @@ Registers a new value (SIE #OBJEKT) under a dimension: e.g. a new project code u
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
-{ code: string, name: string, is_active?: boolean, start_date?: string, end_date?: string }
+{
+  code: string,
+  name: string,
+  is_active?: boolean,
+  start_date?: string | null,
+  end_date?: string | null
+}
+```
+
+Example request:
+```json
+{
+  "code": "P001",
+  "name": "Villa Almgren tak"
+}
 ```
 
 Response `200`:
 ```ts
 {
   data: {
-    id: string,
+    id: string | null,
     dimension_id: string,
     code: string,
     name: string,
     is_active: boolean,
-    start_date: string,
-    end_date: string,
-    created_at: string
+    start_date: string | null,
+    end_date: string | null,
+    created_at: string | null
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "dimension_id": "a8f1…",
+    "code": "P001",
+    "name": "Villa Almgren tak",
+    "is_active": true,
+    "start_date": null,
+    "end_date": null,
+    "created_at": "2026-07-02T12:00:00Z"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -197,10 +356,19 @@ Sparse update of a dimension value (SIE #OBJEKT): name, is_active (false = archi
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
 | `valueId` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
-{ name?: string, is_active?: boolean, start_date?: string, end_date?: string }
+{ name?: string, is_active?: boolean, start_date?: string | null, end_date?: string | null }
+```
+
+Example request:
+```json
+{
+  "end_date": "2026-08-31",
+  "is_active": false
+}
 ```
 
 Response `200`:
@@ -212,15 +380,36 @@ Response `200`:
     code: string,
     name: string,
     is_active: boolean,
-    start_date: string,
-    end_date: string
+    start_date: string | null,
+    end_date: string | null
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "dimension_id": "a8f1…",
+    "code": "P001",
+    "name": "Villa Almgren tak",
+    "is_active": false,
+    "start_date": null,
+    "end_date": "2026-08-31"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -255,9 +444,25 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "deleted": true,
+    "id": "0e9c…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -287,14 +492,38 @@ Response `200`:
 ```ts
 {
   data: {
-    fiscal_periods: { id: string, name: string, period_start: string, period_end: string, is_closed: boolean, closed_at: string, locked_at: string, previous_period_id: string, created_at: string, duration_days: number, exceeds_18_months: boolean }[]
+    fiscal_periods: { id: string, name: string, period_start: string, period_end: string, is_closed: boolean, closed_at: string | null, locked_at: string | null, previous_period_id: string | null, created_at: string, duration_days: number, exceeds_18_months: boolean }[]
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "fiscal_periods": [
+      {
+        "id": "fp_2026",
+        "name": "Räkenskapsår 2026",
+        "period_start": "2026-01-01",
+        "period_end": "2026-12-31",
+        "is_closed": false,
+        "locked_at": null
+      }
+    ]
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -328,9 +557,26 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "a8f1…",
+    "is_closed": true,
+    "closed_at": "2026-05-12T14:30:00Z"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -362,6 +608,13 @@ Request body:
 { as_of_date?: string }
 ```
 
+Example request:
+```json
+{
+  "as_of_date": "2026-12-31"
+}
+```
+
 Response `200`:
 ```ts
 {
@@ -375,9 +628,28 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "operation_id": "0e9c…",
+    "type": "fiscal_periods.currency_revaluation",
+    "status": "succeeded",
+    "poll_url": "/api/v1/operations/0e9c…",
+    "webhook_event": "operation.completed"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -411,9 +683,26 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "a8f1…",
+    "locked_at": "2026-05-12T14:00:00Z",
+    "is_closed": false
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -445,6 +734,13 @@ Request body:
 { next_period_id: string }
 ```
 
+Example request:
+```json
+{
+  "next_period_id": "7b3a…"
+}
+```
+
 Response `200`:
 ```ts
 {
@@ -452,9 +748,27 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "opening_entry_id": "4d2a…",
+    "voucher_series": "A",
+    "voucher_number": 1,
+    "next_period_id": "7b3a…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -494,9 +808,28 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "operation_id": "0e9c…",
+    "type": "fiscal_periods.year_end",
+    "status": "succeeded",
+    "poll_url": "/api/v1/operations/0e9c…",
+    "webhook_event": "operation.completed"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -522,6 +855,10 @@ Fetches the momsdeklaration for one period as Skatteverket has it on file: `subm
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `period_type` | query | `"monthly" \| "quarterly" \| "yearly"` | yes |  |
+| `year` | query | `number` | yes |  |
+| `period` | query | `number` | yes |  |
+| `state` | query | `"submitted" \| "decided" \| "both"` | no |  |
 
 Response `200`:
 ```ts
@@ -530,9 +867,29 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "redovisare": "165560000167",
+    "redovisningsperiod": "202603",
+    "submitted": {
+      "mervardesskattTillfalle": "2026-04-10"
+    },
+    "decided": null
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```

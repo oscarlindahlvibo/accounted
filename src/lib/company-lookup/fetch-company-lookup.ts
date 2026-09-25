@@ -1,0 +1,291 @@
+import { COMPANY_SEARCH_MIN_CHARS } from './types'
+import type { CompanyLookupResult, CompanySearchHit, CompanySuggestion, RegistryHint } from './types'
+import { normalizeOrgNumber } from './normalize-org-number'
+
+/**
+ * Outcome of a client-side company lookup.
+ *
+ * - `found`: a provider answered with company data.
+ * - `not_found`: no provider found the company. `registry`: what SCB knew
+ *   when TIC missed (see RegistryHint), carried by the TIC route's own 404;
+ *   absent on a plain miss.
+ * - `disabled`: the lookup surface is not available at all: no provider
+ *   configured, malformed orgnr, legacy 403, dispatcher 404 ("Extension not
+ *   found" / "Route not found"), or a feature-flag 503 (`code:
+ *   'EXTENSION_DISABLED'`). Degrade silently to the manual path; there is
+ *   nothing the user can do and nothing is wrong with their input.
+ * - `error`: transient failure (429 rate limit, 502/504 upstream, 503
+ *   NOT_CONFIGURED, 500, network) on every provider tried. Show the
+ *   advisory "kunde inte hämta" note and continue manually. Never blocks.
+ * - `aborted`: the caller's AbortSignal fired; ignore the result.
+ */
+export type CompanyLookupOutcome =
+  | { status: 'found'; result: CompanyLookupResult }
+  | { status: 'not_found'; registry?: RegistryHint }
+  | { status: 'disabled' }
+  | { status: 'error' }
+  | { status: 'aborted' }
+
+async function attemptBolagsverket(orgNumber: string, signal?: AbortSignal): Promise<CompanyLookupOutcome> {
+  let res: Response
+  try {
+    res = await fetch(`/api/company-lookup/bolagsverket?org_number=${encodeURIComponent(orgNumber)}`, { signal })
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') return { status: 'aborted' }
+    return { status: 'error' }
+  }
+  if (signal?.aborted) return { status: 'aborted' }
+
+  if (res.ok) {
+    try {
+      const { data } = (await res.json()) as { data: CompanyLookupResult }
+      if (!data || typeof data !== 'object') return { status: 'error' }
+      return { status: 'found', result: data }
+    } catch {
+      return { status: 'error' }
+    }
+  }
+
+  let body: { error?: unknown; code?: unknown } = {}
+  try {
+    const parsed = (await res.json()) as unknown
+    if (parsed && typeof parsed === 'object') body = parsed as { error?: unknown; code?: unknown }
+  } catch {
+    // Non-JSON error body: fall through to status-only mapping.
+  }
+
+  if (res.status === 503 && body.code === 'NOT_CONFIGURED') return { status: 'disabled' }
+  if (res.status === 403) return { status: 'disabled' }
+  if (res.status === 404) {
+    return body.error === 'Company not found' ? { status: 'not_found' } : { status: 'disabled' }
+  }
+  return { status: 'error' }
+}
+
+/**
+ * Shared client-side company lookup for the onboarding surfaces (wizard
+ * Step 2 and the journey flow), and the customer/supplier org-number
+ * lookup button.
+ *
+ * Provider order: Bolagsverket's official VärdefullaDatamängder API first
+ * (free, always attempted -- org-number lookup is core, not
+ * extension-gated). Falls through to the TIC dispatcher (which itself
+ * falls back to SCB and carries a `registry` hint on a miss -- see
+ * RegistryHint) for every Bolagsverket outcome EXCEPT a definitive answer:
+ * `found` and `not_found` are terminal (a confirmed "yes" or "no" from the
+ * official source is not worth second-guessing), while `disabled`
+ * (unconfigured) and `error` (transient) both fall through, so a
+ * Bolagsverket outage degrades to the previously-sole TIC/SCB path instead
+ * of failing outright.
+ *
+ * TIC budget note: this is the ONLY function that may call the Lens-backed
+ * `/lookup` from the client. Callers fire it once per confirmed orgnr
+ * (Enter / picker selection), not per keystroke; every provider keeps its
+ * own process cache as a second guard.
+ */
+export async function fetchCompanyLookup(
+  orgNumber: string,
+  opts: { ticEnabled: boolean; signal?: AbortSignal },
+): Promise<CompanyLookupOutcome> {
+  if (normalizeOrgNumber(orgNumber) === null) return { status: 'disabled' }
+
+  const bolagsverket = await attemptBolagsverket(orgNumber, opts.signal)
+  const isDefinitive = bolagsverket.status === 'found' || bolagsverket.status === 'not_found'
+  if (isDefinitive || bolagsverket.status === 'aborted') return bolagsverket
+
+  if (!opts.ticEnabled) return bolagsverket
+
+  let res: Response
+  try {
+    res = await fetch(
+      `/api/extensions/ext/tic/lookup?org_number=${encodeURIComponent(orgNumber)}`,
+      { signal: opts.signal },
+    )
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') return { status: 'aborted' }
+    return { status: 'error' }
+  }
+  if (opts.signal?.aborted) return { status: 'aborted' }
+
+  if (res.ok) {
+    try {
+      const { data } = (await res.json()) as { data: CompanyLookupResult }
+      if (!data || typeof data !== 'object') return { status: 'error' }
+      return { status: 'found', result: data }
+    } catch {
+      return { status: 'error' }
+    }
+  }
+
+  return mapFailure(res)
+}
+
+export type CompanySearchOutcome =
+  | { status: 'found'; hits: CompanySearchHit[] }
+  | { status: 'not_found' }
+  | { status: 'disabled' }
+  | { status: 'error' }
+  | { status: 'aborted' }
+
+/**
+ * Free-text counterpart of fetchCompanyLookup for the journey's orgnr field,
+ * which also accepts a company name. Same dispatcher, same failure mapping,
+ * same budget rule: fire once per Enter, never per keystroke. Each hit already
+ * carries the full lookup result, so picking one needs no further call.
+ *
+ * TIC-only (no Bolagsverket leg): VärdefullaDatamängder has no free-text
+ * name search, only exact org-number lookup.
+ */
+export async function fetchCompanySearch(
+  query: string,
+  opts: { ticEnabled: boolean; signal?: AbortSignal },
+): Promise<CompanySearchOutcome> {
+  if (!opts.ticEnabled) return { status: 'disabled' }
+  const trimmed = query.trim()
+  if (trimmed.length < COMPANY_SEARCH_MIN_CHARS) return { status: 'disabled' }
+
+  let res: Response
+  try {
+    res = await fetch(`/api/extensions/ext/tic/search?q=${encodeURIComponent(trimmed)}`, {
+      signal: opts.signal,
+    })
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') return { status: 'aborted' }
+    return { status: 'error' }
+  }
+  if (opts.signal?.aborted) return { status: 'aborted' }
+
+  if (res.ok) {
+    try {
+      const { data } = (await res.json()) as { data: CompanySearchHit[] }
+      if (!Array.isArray(data)) return { status: 'error' }
+      const hits = data.filter(
+        (h) => h && typeof h.orgNumber === 'string' && h.result && typeof h.result === 'object',
+      )
+      return hits.length > 0 ? { status: 'found', hits } : { status: 'not_found' }
+    } catch {
+      return { status: 'error' }
+    }
+  }
+
+  return mapFailure(res)
+}
+
+export type CompanySuggestOutcome =
+  | { status: 'found'; suggestions: CompanySuggestion[]; truncated: boolean }
+  | { status: 'empty'; truncated: boolean }
+  | { status: 'disabled' }
+  | { status: 'error' }
+  | { status: 'aborted' }
+
+/**
+ * Search-as-you-type for the journey's orgnr field: SCB's företagsregister
+ * via the core route, never TIC. Free, so the caller may fire it per
+ * debounced keystroke; the AbortSignal drops the superseded request. A
+ * 503 (SCB not configured in this environment) is `disabled` so the field
+ * quietly stays an orgnr-or-Enter field; every other failure is `error`
+ * and the picker just does not appear. Never throws.
+ */
+export async function fetchCompanySuggestions(
+  query: string,
+  opts: { signal?: AbortSignal } = {},
+): Promise<CompanySuggestOutcome> {
+  const trimmed = query.trim()
+  if (trimmed.length < COMPANY_SEARCH_MIN_CHARS) return { status: 'disabled' }
+
+  let res: Response
+  try {
+    res = await fetch(`/api/company/search?q=${encodeURIComponent(trimmed)}`, { signal: opts.signal })
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') return { status: 'aborted' }
+    return { status: 'error' }
+  }
+  if (opts.signal?.aborted) return { status: 'aborted' }
+
+  if (res.ok) {
+    try {
+      const { data } = (await res.json()) as {
+        data: { suggestions: CompanySuggestion[]; truncated: boolean }
+      }
+      if (!data || !Array.isArray(data.suggestions)) return { status: 'error' }
+      const suggestions = data.suggestions.filter(
+        (h) => h && typeof h.orgNumber === 'string' && typeof h.name === 'string',
+      )
+      const truncated = data.truncated === true
+      return suggestions.length > 0 ? { status: 'found', suggestions, truncated } : { status: 'empty', truncated }
+    } catch {
+      return { status: 'error' }
+    }
+  }
+  // Only the route's own "no SCB credentials here" switches the picker off
+  // for the session; an infrastructure 503 is transient like any other.
+  if (res.status === 503) {
+    try {
+      const body = (await res.json()) as { error?: { code?: unknown } }
+      if (body?.error?.code === 'SCB_NOT_CONFIGURED') return { status: 'disabled' }
+    } catch {
+      // Non-JSON 503: transient.
+    }
+  }
+  return { status: 'error' }
+}
+
+/** Shared non-ok mapping: dispatcher misses degrade silently, only the TIC
+ *  handler's own 404 is a user-facing "not found". */
+async function mapFailure(
+  res: Response,
+): Promise<
+  { status: 'not_found'; registry?: RegistryHint } | { status: 'disabled' } | { status: 'error' }
+> {
+  // Non-ok: read the body (best-effort) to disambiguate.
+  let body: { error?: unknown; code?: unknown; registry?: unknown } = {}
+  try {
+    const parsed = (await res.json()) as unknown
+    if (parsed && typeof parsed === 'object') {
+      body = parsed as { error?: unknown; code?: unknown; registry?: unknown }
+    }
+  } catch {
+    // Non-JSON error body: fall through to status-only mapping.
+  }
+
+  if (res.status === 403) return { status: 'disabled' }
+  if (res.status === 404) {
+    // TIC handler: { error: 'Company not found' }, with a `registry` hint
+    // beside it when SCB knew the org number. Dispatcher: 'Extension not
+    // found' / 'Route not found'. Only the former is a user-facing miss.
+    if (body.error !== 'Company not found') return { status: 'disabled' }
+    const registry = registryHintOf(body.registry)
+    return registry ? { status: 'not_found', registry } : { status: 'not_found' }
+  }
+  if (res.status === 503 && body.code === 'EXTENSION_DISABLED') {
+    return { status: 'disabled' }
+  }
+  return { status: 'error' }
+}
+
+/**
+ * The registry hint the TIC route puts beside a 404 when SCB knew the org
+ * number, or undefined when the body carries none or a malformed one: a
+ * hint is a convenience, never a reason to fail the miss.
+ */
+function registryHintOf(value: unknown): RegistryHint | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const v = value as Partial<RegistryHint>
+  if (v.source !== 'scb' || typeof v.companyName !== 'string' || v.companyName.length === 0) return undefined
+  const address =
+    v.address && typeof v.address === 'object'
+      ? {
+          street: typeof v.address.street === 'string' ? v.address.street : null,
+          postalCode: typeof v.address.postalCode === 'string' ? v.address.postalCode : null,
+          city: typeof v.address.city === 'string' ? v.address.city : null,
+        }
+      : null
+  const flag = (x: unknown): boolean | null => (typeof x === 'boolean' ? x : null)
+  return {
+    source: 'scb',
+    companyName: v.companyName,
+    legalEntityType: typeof v.legalEntityType === 'string' ? v.legalEntityType : null,
+    address,
+    registration: { fTax: flag(v.registration?.fTax), vat: flag(v.registration?.vat) },
+  }
+}

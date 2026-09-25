@@ -8,14 +8,14 @@ paths:
 
 Use the `/supabase-migration` skill for new migrations.
 
-**Location**: `supabase/migrations/`: 680+ files. Early migrations use sequential numbering (`20240101000001`-`20240101000038`), later ones use real timestamps.
+**Location**: `supabase/migrations/`. Early migrations use sequential numbering (`20240101000001`-`20240101000038`), later ones use real timestamps.
 
 ## Migration Rules
 
 1. Enable RLS + policies using `user_company_ids()` for company-scoped data
 2. Add `updated_at` trigger via `update_updated_at_column()`
 3. UUID PKs: `DEFAULT uuid_generate_v4()`
-4. Company ownership: `company_id UUID REFERENCES companies NOT NULL` + `user_id UUID REFERENCES auth.users ON DELETE CASCADE NOT NULL`
+4. Company ownership: `company_id UUID REFERENCES companies NOT NULL` + `user_id UUID REFERENCES auth.users ON DELETE CASCADE NOT NULL`. The cascade never fires: deleted accounts keep their `auth.users` row as a tombstone, so classify every new FK to `auth.users` in `tests/pg/account-erasure.pg.test.ts` (erase it in `erase_user_personal_data`, or retain it for the company).
 5. Never modify existing migrations: create new ones
 6. Never modify enforcement triggers (migration 017), legally required
 7. Apply via Supabase MCP `apply_migration`
@@ -60,6 +60,7 @@ Use the `/supabase-migration` skill for new migrations.
 - `user_company_ids()`: RLS helper returning user's company IDs
 - `current_active_company_id()`: RLS-side read of `user_preferences.active_company_id`; the same value the middleware resolves, so Next.js and RLS agree
 - `claim_due_webhook_deliveries()`: Concurrent-safe claim of due `automation_webhooks` deliveries for the cron sender
+- `create_supplier_payment_batch()`: Atomic betalfil batch creation (locks invoices, rechecks active batches in-transaction, header + items together)
 - `get_unlinked_1930_lines()`: Bank reconciliation helper
 - `cleanup_sandbox_user()`, `cleanup_expired_sandbox_users()`: Sandbox lifecycle
 

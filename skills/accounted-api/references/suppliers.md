@@ -27,17 +27,58 @@ Cursor-paginated supplier-invoice list ordered by created_at DESC, id ASC (newes
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `status` | query | `"registered" \| "approved" \| "paid" \| "partially_paid" \| "overdue" \| "disputed" \| "credited" \| "reversed"` | no | Only supplier invoices in this status. |
+| `supplier_id` | query | `string` | no | Only invoices from this supplier (id). |
+| `currency` | query | `string` | no | 3-letter ISO 4217 code, uppercase (e.g. SEK, EUR). |
+| `date_from` | query | `string` | no | YYYY-MM-DD. Invoices with invoice_date on or after this date. |
+| `date_to` | query | `string` | no | YYYY-MM-DD. Invoices with invoice_date on or before this date. |
+| `cursor` | query | `string` | no | Opaque cursor from the previous page's meta.next_cursor. Omit for the first page. |
+| `limit` | query | `number` | no | Page size, 1-100 (default 50). Larger values are clamped to 100. |
 
 Response `200`:
 ```ts
 {
-  data: { id: string, supplier_id: string, supplier_name: string, arrival_number: number, supplier_invoice_number: string, invoice_date: string, due_date: string, status: "registered" | "approved" | "paid" | "partially_paid" | "overdue" | "disputed" | "credited" | "reversed", currency: string, subtotal: number, vat_amount: number, total: number, paid_amount: number, remaining_amount: number, is_credit_note: boolean, paid_at: string, created_at: string }[],
+  data: { id: string, supplier_id: string, supplier_name: string, arrival_number: number, supplier_invoice_number: string, invoice_date: string, due_date: string, status: "registered" | "approved" | "paid" | "partially_paid" | "overdue" | "disputed" | "credited" | "reversed", currency: string, subtotal: number, vat_amount: number, total: number, paid_amount: number, remaining_amount: number, is_credit_note: boolean, paid_at: string | null, created_at: string }[],
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": [
+    {
+      "id": "0e9c…",
+      "supplier_id": "a8f1…",
+      "supplier_name": "Office Depot AB",
+      "arrival_number": 42,
+      "supplier_invoice_number": "2026-1234",
+      "invoice_date": "2026-05-10",
+      "due_date": "2026-06-09",
+      "status": "registered",
+      "currency": "SEK",
+      "subtotal": 1000,
+      "vat_amount": 250,
+      "total": 1250,
+      "paid_amount": 0,
+      "remaining_amount": 1250,
+      "is_credit_note": false,
+      "paid_at": null,
+      "created_at": "2026-05-13T15:00:00Z"
+    }
+  ],
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12",
+    "next_cursor": null
   }
 }
 ```
@@ -68,6 +109,7 @@ Creates a supplier invoice in `registered` status and posts the registration jou
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
@@ -78,7 +120,7 @@ Request body:
   invoice_date: string,
   due_date: string,
   delivery_date?: string | "",
-  currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK",
+  currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK" | "CHF",
   exchange_rate?: number,
   vat_treatment?: "standard_25" | "reduced_12" | "reduced_6" | "reverse_charge" | "export" | "exempt",
   reverse_charge?: boolean,
@@ -86,9 +128,33 @@ Request body:
   notes?: string,
   ore_rounding?: boolean,
   paid_with_private_funds?: boolean,
+  employee_id?: string | null,
+  claimant_name?: string,
+  inbox_item_id?: string | null,
   payment_date?: string,
   default_dimensions?: Record<string, string>,
-  items: { description: string, amount?: number, account_number: string, vat_rate?: 0 | 0.06 | 0.12 | 0.25, vat_amount?: number, reverse_charge_rate?: number, apply_slp?: boolean, vat_code?: string, quantity?: number, unit?: string, unit_price?: number, accrual_period_start?: string, accrual_period_end?: string, accrual_balance_account?: string, dimensions?: Record<string, string> }[]
+  items: { description: string, amount?: number, account_number: string, vat_rate?: 0 | 0.06 | 0.12 | 0.25, vat_amount?: number, reverse_charge_rate?: number, apply_slp?: boolean, vat_code?: string, quantity?: number, unit?: string, unit_price?: number, accrual_period_start?: string | null, accrual_period_end?: string | null, accrual_balance_account?: string | null, dimensions?: Record<string, string> }[]
+}
+```
+
+Example request:
+```json
+{
+  "supplier_id": "a8f1…",
+  "supplier_invoice_number": "2026-1234",
+  "invoice_date": "2026-05-10",
+  "due_date": "2026-06-09",
+  "default_dimensions": {
+    "6": "P001"
+  },
+  "items": [
+    {
+      "description": "Office supplies",
+      "amount": 1000,
+      "account_number": "5410",
+      "vat_rate": 0.25
+    }
+  ]
 }
 ```
 
@@ -109,15 +175,36 @@ Response `200`:
     total: number,
     remaining_amount: number,
     is_credit_note: boolean,
-    registration_journal_entry_id: string,
+    registration_journal_entry_id: string | null,
     created_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "supplier_id": "a8f1…",
+    "arrival_number": 42,
+    "supplier_invoice_number": "2026-1234",
+    "status": "registered",
+    "total": 1250,
+    "registration_journal_entry_id": "7b3a…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -142,6 +229,7 @@ Returns the full supplier-invoice record. Pass ?expand=supplier,items,payments t
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `expand` | query | `string` | no | Comma-separated related records to embed: supplier, items, payments. An unknown key returns 400 VALIDATION_ERROR. |
 
 Response `200`:
 ```ts
@@ -154,10 +242,10 @@ Response `200`:
     invoice_date: string,
     due_date: string,
     received_date: string,
-    delivery_date: string,
+    delivery_date: string | null,
     status: string,
     currency: string,
-    exchange_rate: number,
+    exchange_rate: number | null,
     subtotal: number,
     vat_amount: number,
     total: number,
@@ -166,19 +254,44 @@ Response `200`:
     paid_amount: number,
     remaining_amount: number,
     is_credit_note: boolean,
-    credited_invoice_id: string,
-    registration_journal_entry_id: string,
-    payment_journal_entry_id: string,
-    notes: string,
+    credited_invoice_id: string | null,
+    registration_journal_entry_id: string | null,
+    payment_journal_entry_id: string | null,
+    notes: string | null,
     created_at: string,
     updated_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "supplier_id": "a8f1…",
+    "arrival_number": 42,
+    "supplier_invoice_number": "2026-1234",
+    "status": "registered",
+    "currency": "SEK",
+    "subtotal": 1000,
+    "vat_amount": 250,
+    "total": 1250,
+    "remaining_amount": 1250,
+    "is_credit_note": false
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -204,6 +317,7 @@ Patches a supplier invoice with the supplied fields. Only allowed on `registered
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
@@ -214,6 +328,13 @@ Request body:
   delivery_date?: string | "",
   payment_reference?: string,
   notes?: string
+}
+```
+
+Example request:
+```json
+{
+  "payment_reference": "OCR-1234567890"
 }
 ```
 
@@ -228,10 +349,10 @@ Response `200`:
     invoice_date: string,
     due_date: string,
     received_date: string,
-    delivery_date: string,
+    delivery_date: string | null,
     status: string,
     currency: string,
-    exchange_rate: number,
+    exchange_rate: number | null,
     subtotal: number,
     vat_amount: number,
     total: number,
@@ -240,19 +361,35 @@ Response `200`:
     paid_amount: number,
     remaining_amount: number,
     is_credit_note: boolean,
-    credited_invoice_id: string,
-    registration_journal_entry_id: string,
-    payment_journal_entry_id: string,
-    notes: string,
+    credited_invoice_id: string | null,
+    registration_journal_entry_id: string | null,
+    payment_journal_entry_id: string | null,
+    notes: string | null,
     created_at: string,
     updated_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "payment_reference": "OCR-1234567890"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -278,6 +415,7 @@ Attests a supplier invoice that has not been approved yet (status `registered` o
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Response `200`:
 ```ts
@@ -291,9 +429,27 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "status": "approved",
+    "arrival_number": 42,
+    "supplier_invoice_number": "2026-1234"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -320,6 +476,7 @@ Creates a kreditfaktura that reverses the original supplier invoice. Under accru
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Response `200`:
 ```ts
@@ -329,14 +486,33 @@ Response `200`:
     original_id: string,
     arrival_number: number,
     supplier_invoice_number: string,
-    registration_journal_entry_id: string
+    registration_journal_entry_id: string | null
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "credit_note_id": "4d2a…",
+    "original_id": "0e9c…",
+    "arrival_number": 43,
+    "supplier_invoice_number": "KREDIT-2026-1234",
+    "registration_journal_entry_id": "9c2f…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -348,7 +524,7 @@ Response `200`:
 **Record a payment against a supplier invoice.**
 `scope:suppliers:write · risk:medium · idempotent · dry-run`
 
-Books the payment journal entry (Debit 2440 / Credit 1930 under accrual; or Debit expense + Debit 2641 / Credit 1930 under cash) and flips the SI status to `paid` (full settlement) or `partially_paid`. Strict-mode: a JE failure aborts before any SI mutation. Idempotent. Dry-runnable.
+Books the payment journal entry (Debit 2440 / Credit the payment account under accrual; or Debit expense + Debit 2641 / Credit the payment account under cash) and flips the SI status to `paid` (full settlement) or `partially_paid`. The payment account is `payment_account` when supplied, otherwise 1930 Företagskonto. Strict-mode: a JE failure aborts before any SI mutation. Idempotent. Dry-runnable.
 
 **Use when:** You paid a registered or approved leverantörsfaktura through a channel other than the synced bank flow. For bank-matched payments use POST /transactions/{id}/match-supplier-invoice instead: that path also reconciles the bank line.
 **Do not use for:** Refunding a payment (the public API does not expose unmark-paid; credit the SI instead). Paying a credited or already-paid SI (returns 409 SI_PAID_ALREADY).
@@ -359,11 +535,15 @@ Books the payment journal entry (Debit 2440 / Credit 1930 under accrual; or Debi
 - exchange_rate_difference (SEK delta vs the booked rate at registration) is required for foreign-currency SIs to book the FX gain/loss to 3960 / 7960. Omitting it on a non-SEK SI under accrual mis-books FX.
 - Strict-mode: a JE creation failure ABORTS before the status flip. There is no partial-state recovery banner: retry the call.
 - Cash basis (kontantmetoden) recognizes the expense + ingående moms HERE, not at :create.
+- Cash basis + öresavrundning: a SEK invoice with ore_rounding on and an öre-bearing total is paid in whole kronor, so the generated entry credits the payment account with the rounded amount and books the residual on 3740 (no VAT). amount, paid_amount and remaining_amount stay in exact öre. Invoices whose rounding is already an invoice row on 3740 have a whole-krona total and are unaffected.
+- payment_account picks the BAS account credited for the payment (1930 Företagskonto when omitted, on both the accrual and the cash path). It must be active in the chart of accounts: an unknown or deactivated account returns 400 ACCOUNTS_NOT_IN_CHART and books nothing. Beyond that it is credited exactly as given, with no range check: 19xx bank or kassa is the ordinary choice, but 1630 (betald via skattekontot) and 2893 / 2018 / 2820 (someone else paid, utlägg) are equally valid, so choosing an account that does not represent where the money actually came from is the caller's error to avoid. Unlike the dashboard dialog, this endpoint does not read the company's last-used payment account: omitting the field always means 1930.
+- Duplicate-payment guard: on a full settlement, if a business bank transaction of the same amount around payment_date carries the supplier name (first distinctive token, so abbreviated bank text such as "HI3G" for Hi3G Access AB counts), returns 409 SI_PAID_LIKELY_DUPLICATE with candidate transactions. A candidate with match_reason `already_booked` is a bank row that is ALREADY a verifikat: do not pay the invoice, correct the double booking instead. Retry with `force: true` only after the user confirms, and with a fresh Idempotency-Key (the original is body-hash bound). Also evaluated under dry-run. A forced full settlement is recorded in behandlingshistorik together with the candidates the guard would have flagged.
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
@@ -378,6 +558,13 @@ Request body:
 }
 ```
 
+Example request:
+```json
+{
+  "payment_date": "2026-05-13"
+}
+```
+
 Response `200`:
 ```ts
 {
@@ -387,15 +574,36 @@ Response `200`:
     total: number,
     paid_amount: number,
     remaining_amount: number,
-    paid_at: string,
-    payment_journal_entry_id: string
+    paid_at: string | null,
+    payment_journal_entry_id: string | null
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "status": "paid",
+    "total": 1250,
+    "paid_amount": 1250,
+    "remaining_amount": 0,
+    "paid_at": "2026-05-13",
+    "payment_journal_entry_id": "7b3a…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -420,17 +628,49 @@ Returns active suppliers in created-first order. Pass ?include_archived=true to 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `supplier_type` | query | `"swedish_business" \| "eu_business" \| "non_eu_business"` | no | Only suppliers of this type. |
+| `search` | query | `string` | no | Case-insensitive match on the name (anywhere) or the org number (prefix), 1-200 characters. |
+| `include_archived` | query | `"true" \| "false"` | no | true also returns archived suppliers. Default: false. |
+| `cursor` | query | `string` | no | Opaque cursor from the previous page's meta.next_cursor. Omit for the first page. |
+| `limit` | query | `number` | no | Page size, 1-100 (default 50). Larger values are clamped to 100. |
 
 Response `200`:
 ```ts
 {
-  data: { id: string, name: string, supplier_type: "swedish_business" | "eu_business" | "non_eu_business", email: string, org_number: string, vat_number: string, default_payment_terms: number, default_currency: string, archived_at: string, created_at: string }[],
+  data: { id: string, name: string, supplier_type: "swedish_business" | "eu_business" | "non_eu_business", email: string | null, org_number: string | null, vat_number: string | null, default_payment_terms: number, default_currency: string, party_id?: string | null, archived_at: string | null, created_at: string }[],
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": [
+    {
+      "id": "a8f1…",
+      "name": "Office Depot AB",
+      "supplier_type": "swedish_business",
+      "email": "invoices@officedepot.example",
+      "org_number": "5566778899",
+      "vat_number": "SE556677889901",
+      "default_payment_terms": 30,
+      "default_currency": "SEK",
+      "archived_at": null,
+      "created_at": "2026-04-12T08:30:00Z"
+    }
+  ],
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12",
+    "next_cursor": null
   }
 }
 ```
@@ -456,6 +696,7 @@ Creates a new supplier for the company. Requires Idempotency-Key (UUID). Support
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
@@ -480,8 +721,22 @@ Request body:
   account_number?: string,
   default_expense_account?: string,
   default_payment_terms?: number,
-  default_currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK",
+  default_currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK" | "CHF" | null,
   notes?: string
+}
+```
+
+Example request:
+```json
+{
+  "name": "Office Depot AB",
+  "supplier_type": "swedish_business",
+  "email": "invoices@officedepot.example",
+  "org_number": "556677-8899",
+  "bankgiro": "123-4567",
+  "default_expense_account": "5410",
+  "default_payment_terms": 30,
+  "default_currency": "SEK"
 }
 ```
 
@@ -489,37 +744,63 @@ Response `200`:
 ```ts
 {
   data: {
-    id: string,
+    id: string | null,
     name: string,
     supplier_type: "swedish_business" | "eu_business" | "non_eu_business",
-    email: string,
-    phone: string,
-    address_line1: string,
-    address_line2: string,
-    postal_code: string,
-    city: string,
+    email: string | null,
+    phone: string | null,
+    address_line1: string | null,
+    address_line2: string | null,
+    postal_code: string | null,
+    city: string | null,
     country: string,
-    org_number: string,
-    vat_number: string,
-    bankgiro: string,
-    plusgiro: string,
-    bank_account: string,
-    iban: string,
-    bic: string,
-    default_expense_account: string,
+    org_number: string | null,
+    vat_number: string | null,
+    bankgiro: string | null,
+    plusgiro: string | null,
+    bank_account: string | null,
+    iban: string | null,
+    bic: string | null,
+    default_expense_account: string | null,
     default_payment_terms: number,
     default_currency: string,
-    notes: string,
-    archived_at: string,
-    created_at: string,
-    updated_at: string
+    notes: string | null,
+    archived_at: string | null,
+    created_at: string | null,
+    updated_at: string | null
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "name": "Office Depot AB",
+    "supplier_type": "swedish_business",
+    "email": "invoices@officedepot.example",
+    "org_number": "5566778899",
+    "bankgiro": "123-4567",
+    "default_expense_account": "5410",
+    "default_payment_terms": 30,
+    "default_currency": "SEK",
+    "archived_at": null,
+    "created_at": "2026-05-13T15:00:00Z",
+    "updated_at": "2026-05-13T15:00:00Z"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -531,7 +812,7 @@ Response `200`:
 **Retrieve a single supplier by id.**
 `scope:suppliers:read · risk:low · idempotent`
 
-Returns the full supplier record. Pass ?expand=supplier_invoices to embed any open supplier invoices (registered / approved / partially_paid / overdue / disputed) for the supplier in the same response.
+Returns the full supplier record. Pass ?expand=supplier_invoices to embed any open supplier invoices (registered / approved / partially_paid / overdue / disputed) for the supplier in the same response. Pass ?expand=party to embed the party (motpart) behind the supplier: legal name, org and VAT number, country, the SCB company-register summary (status, legal form, industry, seat, size, registrations, contact details, fetched date) and what the ledger has seen for it.
 
 **Use when:** You need the full supplier record: address, payment terms, banking details, default expense account: before booking a supplier invoice or syncing to an external AP system.
 **Do not use for:** Listing suppliers (use the list endpoint). Looking up customer or employee records (different resources).
@@ -544,6 +825,7 @@ Returns the full supplier record. Pass ?expand=supplier_invoices to embed any op
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `expand` | query | `string` | no | Comma-separated related records to embed: supplier_invoices, party. An unknown key returns 400 VALIDATION_ERROR. |
 
 Response `200`:
 ```ts
@@ -552,34 +834,62 @@ Response `200`:
     id: string,
     name: string,
     supplier_type: string,
-    email: string,
-    phone: string,
-    address_line1: string,
-    address_line2: string,
-    postal_code: string,
-    city: string,
+    email: string | null,
+    phone: string | null,
+    address_line1: string | null,
+    address_line2: string | null,
+    postal_code: string | null,
+    city: string | null,
     country: string,
-    org_number: string,
-    vat_number: string,
-    bankgiro: string,
-    plusgiro: string,
-    bank_account: string,
-    iban: string,
-    bic: string,
-    default_expense_account: string,
+    org_number: string | null,
+    vat_number: string | null,
+    bankgiro: string | null,
+    plusgiro: string | null,
+    bank_account: string | null,
+    iban: string | null,
+    bic: string | null,
+    default_expense_account: string | null,
     default_payment_terms: number,
     default_currency: string,
-    notes: string,
-    archived_at: string,
+    notes: string | null,
+    party_id: string | null,
+    party?: { id: string, display_name: string, legal_name: string | null, org_number: string | null, vat_number: string | null, country: string | null, kind: string, status: "confirmed" | "suggested", roles: { supplier_id: string | null, customer_id: string | null }, registry: { legal_name: string | null, legal_form: string | null, status: { label: string, active: boolean } | null, warning: string | null, registrations: { f_tax: boolean | null, vat: boolean | null, employer: boolean | null }, industry: { code: string, label: string } | null, seat: string | null, registered_at: string | null, active_since: string | null, active_until: string | null, employees_band: string | null, turnover: { band: string, year: string | null } | null, workplaces: number | null, contact: { email: string | null, phone: string | null, address: { co: string | null, street: string | null, postal_code: string | null, city: string | null } | null }, vat_number: string | null, fetched_at: string | null } | null, ledger: { occurrences: number, expense_sek: number, revenue_sek: number, first_seen: string | null, last_seen: string | null, dominant_account: string | null } | null, identities: { scheme: string, value: string, status: string, seen_count: number }[] } | null,
+    archived_at: string | null,
     created_at: string,
     updated_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "a8f1…",
+    "name": "Office Depot AB",
+    "supplier_type": "swedish_business",
+    "email": "invoices@officedepot.example",
+    "org_number": "556677-8899",
+    "bankgiro": "123-4567",
+    "default_expense_account": "5410",
+    "default_payment_terms": 30,
+    "default_currency": "SEK",
+    "archived_at": null,
+    "created_at": "2026-04-12T08:30:00Z",
+    "updated_at": "2026-04-30T11:22:09Z"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -605,13 +915,14 @@ Patches the supplier with the supplied fields. All fields optional. Idempotent (
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
 {
   name?: string,
   supplier_type?: "swedish_business" | "eu_business" | "non_eu_business",
-  email?: string,
+  email?: string | null,
   phone?: string,
   address_line1?: string,
   address_line2?: string,
@@ -627,10 +938,18 @@ Request body:
   bic?: string,
   clearing_number?: string,
   account_number?: string,
-  default_expense_account?: string,
+  default_expense_account?: string | null,
   default_payment_terms?: number,
-  default_currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK",
+  default_currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK" | "CHF" | null,
   notes?: string
+}
+```
+
+Example request:
+```json
+{
+  "default_payment_terms": 14,
+  "notes": "New payment terms agreed 2026-05-12."
 }
 ```
 
@@ -641,34 +960,54 @@ Response `200`:
     id: string,
     name: string,
     supplier_type: string,
-    email: string,
-    phone: string,
-    address_line1: string,
-    address_line2: string,
-    postal_code: string,
-    city: string,
+    email: string | null,
+    phone: string | null,
+    address_line1: string | null,
+    address_line2: string | null,
+    postal_code: string | null,
+    city: string | null,
     country: string,
-    org_number: string,
-    vat_number: string,
-    bankgiro: string,
-    plusgiro: string,
-    bank_account: string,
-    iban: string,
-    bic: string,
-    default_expense_account: string,
+    org_number: string | null,
+    vat_number: string | null,
+    bankgiro: string | null,
+    plusgiro: string | null,
+    bank_account: string | null,
+    iban: string | null,
+    bic: string | null,
+    default_expense_account: string | null,
     default_payment_terms: number,
     default_currency: string,
-    notes: string,
-    archived_at: string,
+    notes: string | null,
+    party_id: string | null,
+    party?: { id: string, display_name: string, legal_name: string | null, org_number: string | null, vat_number: string | null, country: string | null, kind: string, status: "confirmed" | "suggested", roles: { supplier_id: string | null, customer_id: string | null }, registry: { legal_name: string | null, legal_form: string | null, status: { label: string, active: boolean } | null, warning: string | null, registrations: { f_tax: boolean | null, vat: boolean | null, employer: boolean | null }, industry: { code: string, label: string } | null, seat: string | null, registered_at: string | null, active_since: string | null, active_until: string | null, employees_band: string | null, turnover: { band: string, year: string | null } | null, workplaces: number | null, contact: { email: string | null, phone: string | null, address: { co: string | null, street: string | null, postal_code: string | null, city: string | null } | null }, vat_number: string | null, fetched_at: string | null } | null, ledger: { occurrences: number, expense_sek: number, revenue_sek: number, first_seen: string | null, last_seen: string | null, dominant_account: string | null } | null, identities: { scheme: string, value: string, status: string, seen_count: number }[] } | null,
+    archived_at: string | null,
     created_at: string,
     updated_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "name": "Office Depot AB",
+    "default_payment_terms": 14,
+    "notes": "New payment terms agreed 2026-05-12."
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -694,6 +1033,7 @@ Sets archived_at on the supplier; the record is preserved (supplier invoices and
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Response `204`.
 
@@ -718,12 +1058,31 @@ Bulk-create endpoint mirroring /customers/bulk-create. Each supplier is validate
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
 {
-  suppliers: { name: string, supplier_type: "swedish_business" | "eu_business" | "non_eu_business", email?: string, phone?: string, address_line1?: string, address_line2?: string, postal_code?: string, city?: string, country?: string, org_number?: string, vat_number?: string, bankgiro?: string, plusgiro?: string, bank_account?: string, iban?: string, bic?: string, clearing_number?: string, account_number?: string, default_expense_account?: string, default_payment_terms?: number, default_currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK", notes?: string }[],
+  suppliers: { name: string, supplier_type: "swedish_business" | "eu_business" | "non_eu_business", email?: string, phone?: string, address_line1?: string, address_line2?: string, postal_code?: string, city?: string, country?: string, org_number?: string, vat_number?: string, bankgiro?: string, plusgiro?: string, bank_account?: string, iban?: string, bic?: string, clearing_number?: string, account_number?: string, default_expense_account?: string, default_payment_terms?: number, default_currency?: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK" | "CHF" | null, notes?: string }[],
   all_or_nothing?: boolean
+}
+```
+
+Example request:
+```json
+{
+  "suppliers": [
+    {
+      "name": "Office Depot AB",
+      "supplier_type": "swedish_business",
+      "org_number": "556677-8899"
+    },
+    {
+      "name": "Cloud Hosting GmbH",
+      "supplier_type": "eu_business",
+      "vat_number": "DE123456789"
+    }
+  ]
 }
 ```
 
@@ -737,9 +1096,46 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "results": [
+      {
+        "ok": true,
+        "request_index": 0,
+        "data": {
+          "id": "0e9c…",
+          "name": "Office Depot AB"
+        }
+      },
+      {
+        "ok": true,
+        "request_index": 1,
+        "data": {
+          "id": "4d2a…",
+          "name": "Cloud Hosting GmbH"
+        }
+      }
+    ],
+    "summary": {
+      "total": 2,
+      "succeeded": 2,
+      "failed": 0
+    }
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```

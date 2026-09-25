@@ -1,7 +1,7 @@
 #!/usr/bin/env npx tsx
 /**
- * Crontab generator: emits docker/crontab.hosted and docker/crontab.self-hosted
- * from the `crons` array in vercel.json.
+ * Crontab generator: emits docker/crontab.self-hosted from the `crons` array
+ * in vercel.json.
  *
  * vercel.json is the single source of truth for what runs on a schedule. The
  * Docker deployments run the same HTTP endpoints through supercronic, so their
@@ -14,7 +14,7 @@
  * /api/documents/verify/cron ran weekly against a daily vercel.json.
  *
  * Usage:
- *   npx tsx scripts/generate-crontabs.ts   # rewrite both crontabs
+ *   npx tsx scripts/generate-crontabs.ts   # rewrite the crontab
  *   npm run crontabs:generate              # same, via package.json
  *
  * scripts/__tests__/generate-crontabs.test.ts fails CI if the committed files
@@ -30,9 +30,9 @@ const ROOT = dirname(dirname(__filename))
 const VERCEL_JSON_PATH = join(ROOT, 'vercel.json')
 const DOCKER_DIR = join(ROOT, 'docker')
 
-export type CrontabVariant = 'hosted' | 'self-hosted'
+export type CrontabVariant = 'self-hosted'
 
-export const VARIANTS: readonly CrontabVariant[] = ['hosted', 'self-hosted']
+export const VARIANTS: readonly CrontabVariant[] = ['self-hosted']
 
 export interface VercelCron {
   path: string
@@ -41,7 +41,6 @@ export interface VercelCron {
 
 /** The compose file that bind-mounts each variant, quoted in the file header. */
 const MOUNTED_BY: Record<CrontabVariant, string> = {
-  hosted: 'docker-compose.hosted.yml',
   'self-hosted': 'docker-compose.yml',
 }
 
@@ -61,7 +60,7 @@ const CURL_PREFIX = 'curl -sf -H "Authorization: Bearer ${CRON_SECRET}" ${APP_UR
  * Empty, and that is the reviewed answer rather than an oversight:
  *
  *  - Extension endpoints stay in, including extensions the self-hosted preset
- *    does not enable. docker/extensions.self-hosted.json turns on five
+ *    does not enable. docker/extensions.self-hosted.json turns on eight
  *    extensions, but the preset only drives the runtime registry: the
  *    Dockerfile builds the whole app/ tree, so every extension cron route is
  *    compiled into the image either way. And every one of them answers HTTP
@@ -72,7 +71,7 @@ const CURL_PREFIX = 'curl -sf -H "Authorization: Bearer ${CRON_SECRET}" ${APP_UR
  *    cadence, and a self-hoster who enables it later does not have to discover
  *    that the schedule was never there. This also matches the pre-existing
  *    intent: the hand-written crontabs already listed enable-banking and
- *    skattekonto, neither of which is in the self-hosted preset.
+ *    skattekonto, both of which are now in the self-hosted preset (unconfigured extensions no-op).
  *  - /api/sandbox/cleanup/cron stays in. The sandbox is a database flag
  *    (company_settings.is_sandbox), not a hosted-only build flag, and the
  *    cleanup_expired_sandbox_users RPC ships in supabase/migrations
@@ -83,18 +82,19 @@ export const EXCLUDED_PATHS: Readonly<Record<string, string>> = {}
 
 /**
  * Per-variant schedule overrides, path to cron expression. This is where a
- * deliberate hosted/self-hosted divergence gets recorded, so it reads as a
- * decision with a reason instead of as drift in a hand-edited file.
+ * deliberate divergence from the vercel.json (hosted) cadence gets recorded,
+ * so it reads as a decision with a reason instead of as drift in a
+ * hand-edited file.
  *
- * Empty on both variants: every job currently runs the vercel.json cadence
- * everywhere. Two candidates were considered and rejected:
+ * Empty: every job currently runs the vercel.json cadence everywhere. Two
+ * candidates were considered and rejected:
  *
  *  - /api/documents/verify/cron ran weekly ("0 3 * * 0") in the hand-written
  *    crontabs against a daily vercel.json. Not a load concession: the run is
  *    capped at 200 documents (DOCUMENT_VERIFY_BATCH_SIZE) and walks a
  *    nulls-first queue, so weekly drains the WORM integrity queue seven times
  *    slower on a check that exists to satisfy BFL 7-year retention. The weekly
- *    cadence also sat in crontab.hosted, which is not a small box (the two
+ *    cadence also sat in the since-removed hosted Docker crontab (the two
  *    files were byte-identical), so it cannot have been a self-hosted
  *    concession. Treated as drift and realigned to daily.
  *  - /api/webhooks/dispatch/cron at "* * * * *" is 1440 requests/day that
@@ -107,8 +107,37 @@ export const EXCLUDED_PATHS: Readonly<Record<string, string>> = {}
 export const SCHEDULE_OVERRIDES: Readonly<
   Record<CrontabVariant, Readonly<Record<string, string>>>
 > = {
-  hosted: {},
   'self-hosted': {},
+}
+
+/**
+ * Jobs that exist in ONE variant only and therefore have no vercel.json entry
+ * (vercel.json is the hosted schedule). Each carries its reason, the same
+ * discipline as EXCLUDED_PATHS: a self-hosted-only endpoint that silently
+ * lacked a schedule would be dead code that looks alive.
+ *
+ * Rendered after the vercel.json jobs under their own comment line. The
+ * crontab drift test checks both halves: the vercel.json mirror AND that
+ * every EXTRA_JOBS path is a real cron route that vercel.json does NOT
+ * schedule (the moment it does, the entry must go).
+ */
+export interface ExtraJob {
+  path: string
+  schedule: string
+  reason: string
+}
+
+export const EXTRA_JOBS: Readonly<Record<CrontabVariant, readonly ExtraJob[]>> = {
+  'self-hosted': [
+    {
+      path: '/api/connector/sync/cron',
+      schedule: '17 * * * *',
+      reason:
+        'Self-hosted only: refreshes the source=connector capability grants from the instance\'s ' +
+        'GNUBOK_CONNECTOR_KEY (hourly; grants carry a 72h offline grace). Hosted has no connector ' +
+        'key, so the route is not in vercel.json; an instance without a key answers not_configured.',
+    },
+  ],
 }
 
 /** Read and shape-check the `crons` array. */
@@ -178,6 +207,7 @@ export function buildCrontab(
   options: {
     excluded?: Readonly<Record<string, string>>
     overrides?: Readonly<Record<CrontabVariant, Readonly<Record<string, string>>>>
+    extraJobs?: Readonly<Record<CrontabVariant, readonly ExtraJob[]>>
   } = {},
 ): string {
   const excluded = options.excluded ?? EXCLUDED_PATHS
@@ -190,13 +220,22 @@ export function buildCrontab(
       schedule: overrides[variant][cron.path] ?? cron.schedule,
     }))
 
+  const extraJobs = (options.extraJobs ?? EXTRA_JOBS)[variant]
+
   // Align the commands: pad to the widest schedule plus two spaces, the same
   // column convention the hand-written files used.
-  const width = jobs.reduce((max, job) => Math.max(max, job.schedule.length), 0) + 2
+  const width = [...jobs, ...extraJobs].reduce((max, job) => Math.max(max, job.schedule.length), 0) + 2
 
   const lines = [
     ...buildHeader(variant),
     ...jobs.map((job) => `${job.schedule.padEnd(width)}${CURL_PREFIX}${job.path}`),
+    ...(extraJobs.length > 0
+      ? [
+          '',
+          `# ${variant}-only jobs, not in vercel.json: see EXTRA_JOBS in scripts/generate-crontabs.ts`,
+          ...extraJobs.map((job) => `${job.schedule.padEnd(width)}${CURL_PREFIX}${job.path}`),
+        ]
+      : []),
   ]
 
   return `${lines.join('\n')}\n`
@@ -221,9 +260,19 @@ function main(): void {
   }
 
   for (const variant of VARIANTS) {
+    for (const job of EXTRA_JOBS[variant]) {
+      if (crons.some((cron) => cron.path === job.path)) {
+        throw new Error(
+          `EXTRA_JOBS.${variant} lists ${job.path}, which vercel.json now schedules. Remove the extra entry.`,
+        )
+      }
+    }
+  }
+
+  for (const variant of VARIANTS) {
     const target = join(DOCKER_DIR, `crontab.${variant}`)
     writeFileSync(target, buildCrontab(crons, variant), 'utf8')
-    const emitted = crons.filter((cron) => !(cron.path in EXCLUDED_PATHS)).length
+    const emitted = crons.filter((cron) => !(cron.path in EXCLUDED_PATHS)).length + EXTRA_JOBS[variant].length
     const overridden = Object.keys(SCHEDULE_OVERRIDES[variant]).length
     console.log(
       `Wrote docker/crontab.${variant}: ${emitted} jobs` +

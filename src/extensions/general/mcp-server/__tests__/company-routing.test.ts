@@ -1,0 +1,334 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { ALL_SCOPES } from '@/lib/auth/scope-catalog'
+import {
+  addCompanyToNextHint,
+  addCompanyToTopLevelNext,
+  assertMcpCompanyWriteAccess,
+  extractRequestedCompany,
+  isCompanyDependentTool,
+  isTenantWriteScope,
+  projectToolInputSchema,
+  resolveMcpCompanyContext,
+} from '../company-routing'
+
+const DEFAULT_COMPANY_ID = '11111111-1111-4111-8111-111111111111'
+const OTHER_COMPANY_ID = '22222222-2222-4222-8222-222222222222'
+
+// Multi-user seat gate: mocked (real logic covered in
+// lib/entitlements/__tests__/multi-user.test.ts) so the membership chain mock
+// below stays single-purpose. Default entitled; individual tests flip it.
+const getMultiUserStateMock = vi.hoisted(() => vi.fn())
+vi.mock('@/lib/entitlements/multi-user', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/entitlements/multi-user')>(
+    '@/lib/entitlements/multi-user',
+  )
+  return {
+    ...actual,
+    getMultiUserState: (...args: unknown[]) => getMultiUserStateMock(...args),
+  }
+})
+
+beforeEach(() => {
+  getMultiUserStateMock.mockReset()
+  getMultiUserStateMock.mockResolvedValue({ state: 'entitled', graceEndsAt: null })
+})
+
+function membershipClient(result: { data: unknown; error: unknown }) {
+  const chain: Record<string, ReturnType<typeof vi.fn>> = {
+    select: vi.fn(() => chain),
+    eq: vi.fn(() => chain),
+    is: vi.fn(() => chain),
+    maybeSingle: vi.fn().mockResolvedValue(result),
+  }
+  return {
+    client: { from: vi.fn(() => chain) },
+    chain,
+  }
+}
+
+describe('MCP company routing', () => {
+  it('projects company_id onto company-dependent tool schemas without mutating the source', () => {
+    const inputSchema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: { invoice_id: { type: 'string' } },
+      required: ['invoice_id'],
+    }
+
+    const projected = projectToolInputSchema({ name: 'gnubok_send_invoice', inputSchema })
+
+    expect(projected).not.toBe(inputSchema)
+    expect(projected.properties).toEqual({
+      invoice_id: { type: 'string' },
+      company_id: expect.objectContaining({ type: 'string', format: 'uuid' }),
+    })
+    expect(inputSchema.properties).not.toHaveProperty('company_id')
+    expect(projected.additionalProperties).toBe(false)
+  })
+
+  it.each(['gnubok_search_tools', 'gnubok_list_companies'])(
+    'keeps the company-independent schema unchanged for %s',
+    (name) => {
+      const inputSchema = {
+        type: 'object',
+        additionalProperties: false,
+        properties: {},
+      }
+
+      expect(isCompanyDependentTool(name)).toBe(false)
+      expect(projectToolInputSchema({ name, inputSchema })).toBe(inputSchema)
+    }
+  )
+
+  it('extracts and strips a valid company_id before tool execution', () => {
+    expect(
+      extractRequestedCompany({ company_id: OTHER_COMPANY_ID, invoice_id: 'invoice-1' })
+    ).toEqual({
+      requestedCompanyId: OTHER_COMPANY_ID,
+      toolArgs: { invoice_id: 'invoice-1' },
+    })
+  })
+
+  it('rejects a malformed company_id', () => {
+    expect(() => extractRequestedCompany({ company_id: 'not-a-uuid' })).toThrow(
+      expect.objectContaining({ code: 'VALIDATION_ERROR' })
+    )
+  })
+
+  it('checks membership and resolves the requested company role', async () => {
+    const { client, chain } = membershipClient({
+      data: { company_id: OTHER_COMPANY_ID, role: 'admin' },
+      error: null,
+    })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: DEFAULT_COMPANY_ID,
+        requestedCompanyId: OTHER_COMPANY_ID,
+      })
+    ).resolves.toEqual({
+      companyId: OTHER_COMPANY_ID,
+      role: 'admin',
+      isDefault: false,
+    })
+    expect(chain.eq).toHaveBeenCalledWith('user_id', 'user-1')
+    expect(chain.eq).toHaveBeenCalledWith('company_id', OTHER_COMPANY_ID)
+    expect(chain.is).toHaveBeenCalledWith('companies.archived_at', null)
+  })
+
+  it('checks the API key default company when company_id is omitted', async () => {
+    const { client, chain } = membershipClient({
+      data: { company_id: DEFAULT_COMPANY_ID, role: 'owner' },
+      error: null,
+    })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: DEFAULT_COMPANY_ID,
+      })
+    ).resolves.toEqual({
+      companyId: DEFAULT_COMPANY_ID,
+      role: 'owner',
+      isDefault: true,
+    })
+    expect(chain.eq).toHaveBeenCalledWith('company_id', DEFAULT_COMPANY_ID)
+  })
+
+  it('refuses company-dependent calls on a key whose user has no company yet', async () => {
+    // A key minted from the OAuth popup before onboarding (issue #1814) has
+    // no default company. The refusal is a distinct, actionable code and
+    // never reaches the membership lookup.
+    const { client, chain } = membershipClient({ data: null, error: null })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: null,
+      })
+    ).rejects.toMatchObject({ code: 'NO_COMPANY_YET' })
+    expect(chain.maybeSingle).not.toHaveBeenCalled()
+  })
+
+  it('refuses a NON-OWNER membership in a frozen company (multi-user seat gate)', async () => {
+    getMultiUserStateMock.mockResolvedValue({ state: 'frozen', graceEndsAt: null })
+    const { client } = membershipClient({
+      data: { company_id: OTHER_COMPANY_ID, role: 'admin' },
+      error: null,
+    })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: DEFAULT_COMPANY_ID,
+        requestedCompanyId: OTHER_COMPANY_ID,
+      })
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' })
+  })
+
+  it('lets an OWNER through without consulting the seat gate', async () => {
+    getMultiUserStateMock.mockResolvedValue({ state: 'frozen', graceEndsAt: null })
+    const { client } = membershipClient({
+      data: { company_id: DEFAULT_COMPANY_ID, role: 'owner' },
+      error: null,
+    })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: DEFAULT_COMPANY_ID,
+      })
+    ).resolves.toMatchObject({ role: 'owner' })
+    expect(getMultiUserStateMock).not.toHaveBeenCalled()
+  })
+
+  it('lets a non-owner through while the company is in its grace window', async () => {
+    getMultiUserStateMock.mockResolvedValue({
+      state: 'grace',
+      graceEndsAt: new Date(Date.now() + 5 * 86_400_000).toISOString(),
+    })
+    const { client } = membershipClient({
+      data: { company_id: OTHER_COMPANY_ID, role: 'member' },
+      error: null,
+    })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: DEFAULT_COMPANY_ID,
+        requestedCompanyId: OTHER_COMPANY_ID,
+      })
+    ).resolves.toMatchObject({ role: 'member' })
+  })
+
+  it('rejects companies without a current non-archived membership', async () => {
+    const { client } = membershipClient({ data: null, error: null })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: DEFAULT_COMPANY_ID,
+        requestedCompanyId: OTHER_COMPANY_ID,
+      })
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' })
+  })
+
+  it('fails closed when the membership lookup fails', async () => {
+    const { client } = membershipClient({
+      data: null,
+      error: { message: 'database unavailable' },
+    })
+
+    await expect(
+      resolveMcpCompanyContext({
+        supabase: client as never,
+        userId: 'user-1',
+        defaultCompanyId: DEFAULT_COMPANY_ID,
+      })
+    ).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+  })
+
+  it('allows viewer reads but rejects viewer writes, approvals, and management', () => {
+    const context = { companyId: OTHER_COMPANY_ID, role: 'viewer' as const, isDefault: false }
+
+    expect(() => assertMcpCompanyWriteAccess(context, 'reports:read')).not.toThrow()
+    expect(() => assertMcpCompanyWriteAccess(context, undefined)).not.toThrow()
+    expect(() => assertMcpCompanyWriteAccess(context, 'invoices:write')).toThrow(
+      expect.objectContaining({ code: 'FORBIDDEN' })
+    )
+    expect(() => assertMcpCompanyWriteAccess(context, 'pending_operations:approve')).toThrow(
+      expect.objectContaining({ code: 'FORBIDDEN' })
+    )
+    expect(() => assertMcpCompanyWriteAccess(context, 'webhooks:manage')).toThrow(
+      expect.objectContaining({ code: 'FORBIDDEN' })
+    )
+    expect(() => assertMcpCompanyWriteAccess(context, 'reconciliation:signoff')).toThrow(
+      expect.objectContaining({ code: 'FORBIDDEN' })
+    )
+  })
+
+  it('names the read-only role and the refused scope in the viewer refusal', () => {
+    const context = { companyId: OTHER_COMPANY_ID, role: 'viewer' as const, isDefault: false }
+
+    expect(() => assertMcpCompanyWriteAccess(context, 'bookkeeping:write')).toThrow(
+      expect.objectContaining({
+        code: 'FORBIDDEN',
+        message: expect.stringMatching(/read-only \(viewer\).*"bookkeeping:write"/),
+      })
+    )
+  })
+
+  it.each(['owner', 'admin', 'member'] as const)('lets a %s through on every scope', (role) => {
+    const context = { companyId: OTHER_COMPANY_ID, role, isDefault: false }
+    for (const scope of ALL_SCOPES) {
+      expect(() => assertMcpCompanyWriteAccess(context, scope)).not.toThrow()
+    }
+  })
+
+  it('classifies every non-:read scope in the catalogue as a tenant write', () => {
+    // Derived from scopeKind rather than an allowlist of suffixes, so a scope
+    // added with a new suffix is viewer-gated by default. Pin the split.
+    const writes = ALL_SCOPES.filter((scope) => isTenantWriteScope(scope))
+    const reads = ALL_SCOPES.filter((scope) => !isTenantWriteScope(scope))
+
+    expect(reads.length).toBeGreaterThan(0)
+    expect(reads.every((scope) => scope.endsWith(':read'))).toBe(true)
+    expect(writes.every((scope) => !scope.endsWith(':read'))).toBe(true)
+    expect(writes).toEqual(
+      expect.arrayContaining([
+        'invoices:write',
+        'pending_operations:approve',
+        'webhooks:manage',
+        'reconciliation:signoff',
+      ])
+    )
+    expect(isTenantWriteScope(undefined)).toBe(false)
+  })
+
+  it('keeps company context in follow-up tool hints', () => {
+    const next = {
+      tool: 'gnubok_approve_pending_operation',
+      description: 'Approve the operation',
+      args: { operation_id: 'operation-1' },
+    }
+
+    expect(addCompanyToNextHint(next, OTHER_COMPANY_ID)).toEqual({
+      ...next,
+      args: { operation_id: 'operation-1', company_id: OTHER_COMPANY_ID },
+    })
+    expect(addCompanyToTopLevelNext({ data: {}, next }, OTHER_COMPANY_ID)).toEqual({
+      data: {},
+      next: {
+        ...next,
+        args: { operation_id: 'operation-1', company_id: OTHER_COMPANY_ID },
+      },
+    })
+  })
+})
+
+describe('optional-company tools (issue #1814)', () => {
+  it.each(['gnubok_list_skills', 'gnubok_load_skill'])('%s is company-independent but still advertises company_id', (name) => {
+    expect(isCompanyDependentTool(name)).toBe(false)
+    const projected = projectToolInputSchema({
+      name,
+      inputSchema: { type: 'object', properties: { tag: { type: 'string' } } },
+    })
+    expect((projected.properties as Record<string, unknown>).company_id).toBeDefined()
+  })
+
+  it('purely context-free tools do not advertise company_id', () => {
+    const projected = projectToolInputSchema({
+      name: 'gnubok_search_tools',
+      inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
+    })
+    expect((projected.properties as Record<string, unknown>).company_id).toBeUndefined()
+  })
+})

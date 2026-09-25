@@ -11,6 +11,11 @@
  *
  * Note: .env.local points at production; this only SELECTs, so it is safe, but
  * it is still the prod corpus you are reading.
+ *
+ * The corpus is anonymous (20260922173222): a sample is a model score, the
+ * proposed and booked BAS account, and whether they matched. It carries no
+ * company_id and no free text, so there is nothing here to attribute to a
+ * tenant and no per-company consent to filter on.
  */
 import { createClient } from '@supabase/supabase-js'
 import {
@@ -31,13 +36,15 @@ if (!url || !key) {
 const supabase = createClient(url, key)
 
 async function main() {
+  // The corpus is anonymous (20260922173222): no company_id to filter on and
+  // no per-company consent to check. Paged because PostgREST caps at 1000.
   const rows: { confidence: number; was_correct: boolean }[] = []
   const PAGE = 1000
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase
       .from('categorize_calibration_samples')
       .select('confidence, was_correct')
-      .order('created_at', { ascending: false })
+      .order('id', { ascending: true })
       .range(from, from + PAGE - 1)
     if (error) throw error
     if (!data || data.length === 0) break

@@ -7,6 +7,7 @@ import {
   readVercelCrons,
   scheduleFor,
   EXCLUDED_PATHS,
+  EXTRA_JOBS,
   SCHEDULE_OVERRIDES,
   VARIANTS,
   type CrontabVariant,
@@ -41,18 +42,29 @@ function parseCrontab(text: string): { path: string; schedule: string }[] {
 }
 
 const expectedPaths = crons.map((c) => c.path).filter((p) => !(p in EXCLUDED_PATHS))
+const expectedPathsFor = (variant: CrontabVariant) => [
+  ...expectedPaths,
+  ...EXTRA_JOBS[variant].map((job) => job.path),
+]
 
 describe('docker crontabs mirror vercel.json', () => {
-  it.each(VARIANTS)('crontab.%s covers exactly the vercel.json path set minus exclusions', (variant) => {
+  it.each(VARIANTS)('crontab.%s covers exactly the vercel.json path set minus exclusions, plus its EXTRA_JOBS', (variant) => {
     const actual = parseCrontab(crontabText(variant)).map((job) => job.path)
 
     // Sorted comparison gives a readable diff of what is missing / extra;
     // the order assertion below covers sequence separately.
-    expect([...actual].sort()).toEqual([...expectedPaths].sort())
+    expect([...actual].sort()).toEqual([...expectedPathsFor(variant)].sort())
   })
 
-  it.each(VARIANTS)('crontab.%s keeps vercel.json order', (variant) => {
-    expect(parseCrontab(crontabText(variant)).map((job) => job.path)).toEqual(expectedPaths)
+  it.each(VARIANTS)('crontab.%s keeps vercel.json order, EXTRA_JOBS last', (variant) => {
+    expect(parseCrontab(crontabText(variant)).map((job) => job.path)).toEqual(expectedPathsFor(variant))
+  })
+
+  it.each(VARIANTS)('crontab.%s runs its EXTRA_JOBS on their declared cadence', (variant) => {
+    const actual = new Map(parseCrontab(crontabText(variant)).map((job) => [job.path, job.schedule]))
+    for (const job of EXTRA_JOBS[variant]) {
+      expect(actual.get(job.path), `schedule for extra job ${job.path}`).toBe(job.schedule)
+    }
   })
 
   it.each(VARIANTS)('crontab.%s runs every path on its vercel.json cadence', (variant) => {
@@ -79,15 +91,22 @@ describe('docker crontabs mirror vercel.json', () => {
       expect(raw[raw.length - 1], `trailing newline in crontab.${variant}`).toBe(0x0a)
     }
   })
+})
 
-  it('keeps the two variants identical apart from the variant header line', () => {
-    const hosted = crontabText('hosted').split('\n')
-    const selfHosted = crontabText('self-hosted').split('\n')
-    const differing = hosted.filter((line, i) => line !== selfHosted[i])
-
-    // Any real divergence must come from SCHEDULE_OVERRIDES, which is empty
-    // today. If that changes, widen this expectation deliberately.
-    expect(differing).toEqual([expect.stringContaining('# Variant: hosted')])
+describe('EXTRA_JOBS', () => {
+  it('names real cron routes that vercel.json does not schedule, each with a reason', () => {
+    const scheduled = new Set(crons.map((c) => c.path))
+    for (const variant of VARIANTS) {
+      for (const job of EXTRA_JOBS[variant]) {
+        expect(job.reason.trim().length, `${job.path} needs a reason`).toBeGreaterThan(0)
+        expect(job.schedule.trim().split(/\s+/).length, `${job.path} needs a 5-field schedule`).toBe(5)
+        expect(scheduled.has(job.path), `${job.path} is now in vercel.json: drop the extra entry`).toBe(false)
+        expect(
+          existsSync(join(ROOT, 'src', 'app', ...job.path.split('/').filter(Boolean), 'route.ts')),
+          `${job.path} has no route.ts`,
+        ).toBe(true)
+      }
+    }
   })
 })
 
@@ -118,7 +137,8 @@ describe('exclusion and override tables', () => {
     ]
     const rendered = buildCrontab(sample, 'self-hosted', {
       excluded: { '/api/drop/cron': 'vercel-only, cannot work self-hosted' },
-      overrides: { hosted: {}, 'self-hosted': { '/api/keep/cron': '*/30 * * * *' } },
+      overrides: { 'self-hosted': { '/api/keep/cron': '*/30 * * * *' } },
+      extraJobs: { 'self-hosted': [] },
     })
     const jobs = parseCrontab(rendered)
 
@@ -126,10 +146,32 @@ describe('exclusion and override tables', () => {
     expect(rendered).not.toContain('/api/drop/cron')
   })
 
-  it('renders the curl invocation with unexpanded shell variables', () => {
-    const rendered = buildCrontab([{ path: '/api/x/cron', schedule: '0 1 * * *' }], 'hosted', {
+  it('renders extra jobs after the vercel.json jobs under their own comment line', () => {
+    const rendered = buildCrontab([{ path: '/api/keep/cron', schedule: '0 1 * * *' }], 'self-hosted', {
       excluded: {},
-      overrides: { hosted: {}, 'self-hosted': {} },
+      overrides: { 'self-hosted': {} },
+      extraJobs: {
+        'self-hosted': [{ path: '/api/only-here/cron', schedule: '17 * * * *', reason: 'test' }],
+      },
+    })
+    expect(parseCrontab(rendered)).toEqual([
+      { path: '/api/keep/cron', schedule: '0 1 * * *' },
+      { path: '/api/only-here/cron', schedule: '17 * * * *' },
+    ])
+    expect(rendered).toContain('# self-hosted-only jobs, not in vercel.json')
+    // A variant with no extra jobs gets no tail at all
+    const noExtras = buildCrontab([{ path: '/api/keep/cron', schedule: '0 1 * * *' }], 'self-hosted', {
+      excluded: {},
+      overrides: { 'self-hosted': {} },
+      extraJobs: { 'self-hosted': [] },
+    })
+    expect(noExtras).not.toContain('not in vercel.json')
+  })
+
+  it('renders the curl invocation with unexpanded shell variables', () => {
+    const rendered = buildCrontab([{ path: '/api/x/cron', schedule: '0 1 * * *' }], 'self-hosted', {
+      excluded: {},
+      overrides: { 'self-hosted': {} },
     })
     expect(rendered).toContain(
       'curl -sf -H "Authorization: Bearer ${CRON_SECRET}" ${APP_URL}/api/x/cron',
@@ -195,8 +237,11 @@ function findCronRoutes(dir: string, urlPrefix: string): string[] {
 
 describe('every cron route has a schedule', () => {
   it('leaves no unscheduled cron route undocumented', () => {
-    const routes = findCronRoutes(join(ROOT, 'app', 'api'), '/api')
-    const scheduled = new Set(crons.map((c) => c.path))
+    const routes = findCronRoutes(join(ROOT, 'src', 'app', 'api'), '/api')
+    const scheduled = new Set([
+      ...crons.map((c) => c.path),
+      ...VARIANTS.flatMap((variant) => EXTRA_JOBS[variant].map((job) => job.path)),
+    ])
 
     const orphans = routes.filter((r) => !scheduled.has(r) && !(r in INTENTIONALLY_UNSCHEDULED))
     expect(
@@ -207,7 +252,7 @@ describe('every cron route has a schedule', () => {
   })
 
   it('lists no route in INTENTIONALLY_UNSCHEDULED that has since been scheduled or deleted', () => {
-    const routes = new Set(findCronRoutes(join(ROOT, 'app', 'api'), '/api'))
+    const routes = new Set(findCronRoutes(join(ROOT, 'src', 'app', 'api'), '/api'))
     const scheduled = new Set(crons.map((c) => c.path))
 
     for (const [path, reason] of Object.entries(INTENTIONALLY_UNSCHEDULED)) {

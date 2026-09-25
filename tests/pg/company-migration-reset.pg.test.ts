@@ -72,6 +72,9 @@ describe('company migration reset RPCs (pg)', () => {
       legacy_snapshot_143004_authenticated: boolean
       legacy_snapshot_224000_authenticated: boolean
       legacy_snapshot_231500_authenticated: boolean
+      legacy_snapshot_20260826150000_authenticated: boolean
+      legacy_snapshot_20260909100400_authenticated: boolean
+      legacy_reset_20260909100400_authenticated: boolean
     }>(`
       SELECT
         has_function_privilege(
@@ -118,7 +121,22 @@ describe('company migration reset RPCs (pg)', () => {
           'authenticated',
           'public.company_migration_reset_snapshot_before_20260818231500(uuid)',
           'EXECUTE'
-        ) AS legacy_snapshot_231500_authenticated
+        ) AS legacy_snapshot_231500_authenticated,
+        has_function_privilege(
+          'authenticated',
+          'public.company_migration_reset_snapshot_before_20260826150000(uuid)',
+          'EXECUTE'
+        ) AS legacy_snapshot_20260826150000_authenticated,
+        has_function_privilege(
+          'authenticated',
+          'public.company_migration_reset_snapshot_before_20260909100400(uuid)',
+          'EXECUTE'
+        ) AS legacy_snapshot_20260909100400_authenticated,
+        has_function_privilege(
+          'authenticated',
+          'public.reset_company_for_migration_before_20260909100400(uuid,text,text,boolean,boolean)',
+          'EXECUTE'
+        ) AS legacy_reset_20260909100400_authenticated
     `)
 
     expect(rows[0]).toEqual({
@@ -131,6 +149,9 @@ describe('company migration reset RPCs (pg)', () => {
       legacy_snapshot_143004_authenticated: false,
       legacy_snapshot_224000_authenticated: false,
       legacy_snapshot_231500_authenticated: false,
+      legacy_snapshot_20260826150000_authenticated: false,
+      legacy_snapshot_20260909100400_authenticated: false,
+      legacy_reset_20260909100400_authenticated: false,
     })
   })
 
@@ -175,24 +196,11 @@ describe('company migration reset RPCs (pg)', () => {
     })
   })
 
-  it('fails closed on locks, journal entries, filings, live bank sync, and age', async () => {
+  it('fails closed on locks, filings, live bank sync, and age', async () => {
     const locked = await seedCompany({ isClosed: true })
     const lockedPreview = await preview(locked.userId, locked.companyId)
     expect(lockedPreview.eligibility?.blockers).toContainEqual({
       code: 'locked_or_closed_periods',
-      count: 1,
-    })
-
-    const nonImport = await seedCompany()
-    await insertDraftJournalEntry({
-      ...nonImport,
-      status: 'posted',
-      sourceType: 'manual',
-      voucherNumber: 1,
-    })
-    const nonImportPreview = await preview(nonImport.userId, nonImport.companyId)
-    expect(nonImportPreview.eligibility?.blockers).toContainEqual({
-      code: 'journal_entries_exist',
       count: 1,
     })
 
@@ -299,11 +307,14 @@ describe('company migration reset RPCs (pg)', () => {
       count: 1,
     })
 
+    // A bank file import, not a legacy SIE row: since 20260920190300 a
+    // sie_imports row without a durable job cannot claim 'pending' (#2566). An
+    // unfinished durable SIE job is pinned in lib/import/__tests__/sie-job.pg.test.ts.
     const importing = await seedCompany()
     await getPool().query(
-      `INSERT INTO public.sie_imports
-         (user_id, company_id, filename, file_hash, sie_type, status)
-       VALUES ($1, $2, 'pending.se', $3, 4, 'pending')`,
+      `INSERT INTO public.bank_file_imports
+         (user_id, company_id, filename, file_hash, file_format, status)
+       VALUES ($1, $2, 'pending.csv', $3, 'seb', 'pending')`,
       [importing.userId, importing.companyId, randomUUID()],
     )
     const importingPreview = await preview(importing.userId, importing.companyId)
@@ -320,6 +331,20 @@ describe('company migration reset RPCs (pg)', () => {
     )
     const automatedPreview = await preview(automated.userId, automated.companyId)
     expect(automatedPreview.eligibility?.blockers).toContainEqual({
+      code: 'active_integrations_or_schedules',
+      count: 1,
+    })
+
+    // A pending Zettle connection is an integration too (20260909100400 wraps
+    // the snapshot instead of re-issuing its body).
+    const pos = await seedCompany()
+    await getPool().query(
+      `INSERT INTO public.zettle_connections (company_id, user_id, status)
+       VALUES ($1, $2, 'pending')`,
+      [pos.companyId, pos.userId],
+    )
+    const posPreview = await preview(pos.userId, pos.companyId)
+    expect(posPreview.eligibility?.blockers).toContainEqual({
       code: 'active_integrations_or_schedules',
       count: 1,
     })
@@ -361,7 +386,11 @@ describe('company migration reset RPCs (pg)', () => {
     })
   })
 
-  it('blocks drafts, imported postings, linked documents, and voucher sequence state', async () => {
+  // Journal entries, voucher sequences, and linked documents are retained
+  // data, not blockers (20260826150000). The reset must leave every one of
+  // them on the write-closed source and give the replacement a fresh voucher
+  // namespace.
+  it('retains drafts, postings, linked documents, and voucher sequence state instead of blocking', async () => {
     const draft = await seedCompany()
     await insertDraftJournalEntry({
       ...draft,
@@ -369,10 +398,9 @@ describe('company migration reset RPCs (pg)', () => {
       sourceType: 'manual',
     })
     const draftPreview = await preview(draft.userId, draft.companyId)
-    expect(draftPreview.eligibility?.blockers).toContainEqual({
-      code: 'journal_entries_exist',
-      count: 1,
-    })
+    expect(draftPreview.eligibility?.eligible).toBe(true)
+    expect(draftPreview.eligibility?.blockers).toEqual([])
+    expect(draftPreview.eligibility?.counts.journal_entries).toBe(1)
 
     const imported = await seedCompany()
     const importEntryId = await insertDraftJournalEntry({
@@ -381,6 +409,13 @@ describe('company migration reset RPCs (pg)', () => {
       sourceType: 'import',
       voucherSeries: 'A',
       voucherNumber: 40,
+    })
+    const manualEntryId = await insertDraftJournalEntry({
+      ...imported,
+      status: 'posted',
+      sourceType: 'manual',
+      voucherSeries: 'A',
+      voucherNumber: 41,
     })
     const documentId = randomUUID()
     await getPool().query(
@@ -400,100 +435,146 @@ describe('company migration reset RPCs (pg)', () => {
     await getPool().query(
       `INSERT INTO public.voucher_sequences
          (user_id, company_id, fiscal_period_id, voucher_series, last_number)
-       VALUES ($1, $2, $3, 'A', 40)`,
+       VALUES ($1, $2, $3, 'A', 41)`,
       [imported.userId, imported.companyId, imported.fiscalPeriodId],
     )
 
     const importedPreview = await preview(imported.userId, imported.companyId)
-    expect(importedPreview.eligibility?.blockers).toEqual(expect.arrayContaining([
-      { code: 'journal_entries_exist', count: 1 },
-      { code: 'voucher_sequence_state_exists', count: 1 },
-    ]))
-    expect(importedPreview.eligibility?.blockers).not.toContainEqual(
-      expect.objectContaining({ code: 'non_import_committed_entries' }),
-    )
-
-    await expect(execute(imported.userId, imported.companyId)).resolves.toMatchObject({
-      ok: false,
-      code: 'COMPANY_RESET_INELIGIBLE',
-    })
-    const retained = await getPool().query<{
-      archived_at: string | null
-      entry_exists: boolean
-      linked_document_exists: boolean
-      sequence_last_number: number
-      reset_count: number
-    }>(
-      `SELECT
-         (SELECT archived_at::text FROM public.companies WHERE id = $1) AS archived_at,
-         EXISTS (SELECT 1 FROM public.journal_entries WHERE id = $2) AS entry_exists,
-         EXISTS (
-           SELECT 1 FROM public.document_attachments
-           WHERE id = $3 AND journal_entry_id = $2
-         ) AS linked_document_exists,
-         (SELECT last_number::int FROM public.voucher_sequences
-          WHERE company_id = $1 AND voucher_series = 'A') AS sequence_last_number,
-         (SELECT count(*)::int FROM public.company_migration_resets
-          WHERE source_company_id = $1) AS reset_count`,
-      [imported.companyId, importEntryId, documentId],
-    )
-    expect(retained.rows[0]).toEqual({
-      archived_at: null,
-      entry_exists: true,
-      linked_document_exists: true,
-      sequence_last_number: 40,
-      reset_count: 0,
+    expect(importedPreview.eligibility?.eligible).toBe(true)
+    expect(importedPreview.eligibility?.blockers).toEqual([])
+    expect(importedPreview.eligibility?.counts).toMatchObject({
+      journal_entries: 2,
+      committed_import_entries: 1,
+      voucher_sequences: 1,
+      documents: 1,
     })
 
-    const sequenceOnly = await seedCompany()
-    await getPool().query(
-      `INSERT INTO public.voucher_sequences
-         (user_id, company_id, fiscal_period_id, voucher_series, last_number)
-       VALUES ($1, $2, $3, 'B', 0)`,
-      [sequenceOnly.userId, sequenceOnly.companyId, sequenceOnly.fiscalPeriodId],
-    )
-    const sequencePreview = await preview(sequenceOnly.userId, sequenceOnly.companyId)
-    expect(sequencePreview.eligibility?.blockers).toContainEqual({
-      code: 'voucher_sequence_state_exists',
-      count: 1,
+    // withUserContext rolls back, so the post-reset state is read inside the
+    // same transaction, mirroring the atomic archive-and-replace test below.
+    await withUserContext(imported.userId, async (client) => {
+      const { rows } = await client.query<{ result: RpcResult }>(
+        `SELECT public.reset_company_for_migration($1, $2, $3, true, true) AS result`,
+        [imported.companyId, 'Test AB', 'The fiscal years were imported in the wrong order.'],
+      )
+      const result = rows[0]!.result
+      expect(result).toMatchObject({ ok: true, source_company_id: imported.companyId })
+      const replacementId = result.replacement_company_id!
+      await client.query('RESET ROLE')
+
+      const retained = await client.query<{
+        source_archived: boolean
+        import_entry_exists: boolean
+        manual_entry_exists: boolean
+        linked_document_exists: boolean
+        sequence_last_number: number
+        recorded_journal_entries: number
+        replacement_entries: number
+        replacement_sequences: number
+      }>(
+        `SELECT
+           (SELECT archived_at IS NOT NULL FROM public.companies WHERE id = $1) AS source_archived,
+           EXISTS (
+             SELECT 1 FROM public.journal_entries
+             WHERE id = $2 AND company_id = $1 AND status = 'posted'
+           ) AS import_entry_exists,
+           EXISTS (
+             SELECT 1 FROM public.journal_entries
+             WHERE id = $3 AND company_id = $1 AND status = 'posted'
+           ) AS manual_entry_exists,
+           EXISTS (
+             SELECT 1 FROM public.document_attachments
+             WHERE id = $4 AND company_id = $1 AND journal_entry_id = $2
+           ) AS linked_document_exists,
+           (SELECT last_number::int FROM public.voucher_sequences
+            WHERE company_id = $1 AND voucher_series = 'A') AS sequence_last_number,
+           (SELECT (source_counts ->> 'journal_entries')::int
+            FROM public.company_migration_resets
+            WHERE source_company_id = $1) AS recorded_journal_entries,
+           (SELECT count(*)::int FROM public.journal_entries
+            WHERE company_id = $5) AS replacement_entries,
+           (SELECT count(*)::int FROM public.voucher_sequences
+            WHERE company_id = $5) AS replacement_sequences`,
+        [imported.companyId, importEntryId, manualEntryId, documentId, replacementId],
+      )
+      expect(retained.rows[0]).toEqual({
+        source_archived: true,
+        import_entry_exists: true,
+        manual_entry_exists: true,
+        linked_document_exists: true,
+        sequence_last_number: 41,
+        recorded_journal_entries: 2,
+        replacement_entries: 0,
+        replacement_sequences: 0,
+      })
     })
   })
 
-  it('blocks customer and supplier invoice records before any voucher exists', async () => {
-    const customerInvoice = await seedCompany()
+  it('retains customer and supplier invoice records instead of blocking', async () => {
+    const { userId, companyId } = await seedCompany()
     await getPool().query(
       `INSERT INTO public.invoices
          (user_id, company_id, invoice_number, invoice_date, due_date, status)
        VALUES ($1, $2, 1, '2026-08-01', '2026-08-31', 'sent')`,
-      [customerInvoice.userId, customerInvoice.companyId],
+      [userId, companyId],
     )
-    const customerPreview = await preview(customerInvoice.userId, customerInvoice.companyId)
-    expect(customerPreview.eligibility?.blockers).toContainEqual({
-      code: 'invoice_records_exist',
-      count: 1,
-    })
-    expect(customerPreview.eligibility?.blockers).not.toContainEqual(
-      expect.objectContaining({ code: 'journal_entries_exist' }),
-    )
-
-    const supplierInvoice = await seedCompany()
     const supplierId = randomUUID()
     await getPool().query(
       `INSERT INTO public.suppliers (id, user_id, company_id, name)
        VALUES ($1, $2, $3, 'Leverantor AB')`,
-      [supplierId, supplierInvoice.userId, supplierInvoice.companyId],
+      [supplierId, userId, companyId],
     )
     await getPool().query(
       `INSERT INTO public.supplier_invoices
          (user_id, company_id, supplier_id, arrival_number,
           supplier_invoice_number, invoice_date, due_date)
        VALUES ($1, $2, $3, 1, 'SUP-1', '2026-08-01', '2026-08-31')`,
-      [supplierInvoice.userId, supplierInvoice.companyId, supplierId],
+      [userId, companyId, supplierId],
     )
-    const supplierPreview = await preview(supplierInvoice.userId, supplierInvoice.companyId)
-    expect(supplierPreview.eligibility?.blockers).toContainEqual({
-      code: 'invoice_records_exist',
-      count: 1,
+
+    const invoicePreview = await preview(userId, companyId)
+    expect(invoicePreview.eligibility?.eligible).toBe(true)
+    expect(invoicePreview.eligibility?.blockers).toEqual([])
+    expect(invoicePreview.eligibility?.counts).toMatchObject({
+      invoices: 1,
+      supplier_invoices: 1,
+      suppliers: 1,
+    })
+
+    await withUserContext(userId, async (client) => {
+      const { rows } = await client.query<{ result: RpcResult }>(
+        `SELECT public.reset_company_for_migration($1, $2, $3, true, true) AS result`,
+        [companyId, 'Test AB', 'The invoice import mapped the wrong accounts.'],
+      )
+      const result = rows[0]!.result
+      expect(result).toMatchObject({ ok: true, source_company_id: companyId })
+      const replacementId = result.replacement_company_id!
+      await client.query('RESET ROLE')
+
+      const retained = await client.query<{
+        source_archived: boolean
+        source_invoices: number
+        source_supplier_invoices: number
+        replacement_invoices: number
+        replacement_supplier_invoices: number
+        replacement_suppliers: number
+      }>(
+        `SELECT
+           (SELECT archived_at IS NOT NULL FROM public.companies WHERE id = $1) AS source_archived,
+           (SELECT count(*)::int FROM public.invoices WHERE company_id = $1) AS source_invoices,
+           (SELECT count(*)::int FROM public.supplier_invoices WHERE company_id = $1) AS source_supplier_invoices,
+           (SELECT count(*)::int FROM public.invoices WHERE company_id = $2) AS replacement_invoices,
+           (SELECT count(*)::int FROM public.supplier_invoices WHERE company_id = $2) AS replacement_supplier_invoices,
+           (SELECT count(*)::int FROM public.suppliers WHERE company_id = $2) AS replacement_suppliers`,
+        [companyId, replacementId],
+      )
+      expect(retained.rows[0]).toEqual({
+        source_archived: true,
+        source_invoices: 1,
+        source_supplier_invoices: 1,
+        replacement_invoices: 0,
+        replacement_supplier_invoices: 0,
+        replacement_suppliers: 0,
+      })
     })
   })
 
@@ -625,6 +706,7 @@ describe('company migration reset RPCs (pg)', () => {
         'company_settings',
         'rot_rut_payout_requests',
         'salary_line_items',
+        'salary_payment_files',
         'salary_run_employees',
         'salary_runs',
         'skatteverket_api_audit_log',
@@ -789,12 +871,16 @@ describe('company migration reset RPCs (pg)', () => {
     await getPool().query(
       `INSERT INTO public.company_settings
          (user_id, company_id, entity_type, company_name, org_number,
-          onboarding_complete, next_invoice_number, next_arrival_number)
-       VALUES ($1, $2, 'aktiebolag', 'Migration AB', '5590000001', true, 41, 17)`,
+          onboarding_complete, onboarding_step, next_invoice_number, next_arrival_number,
+          initial_setup_path, initial_setup_completed_at)
+       VALUES ($1, $2, 'aktiebolag', 'Migration AB', '5590000001', true, 4, 41, 17,
+               'migration', now())`,
       [userId, companyId],
     )
     // The replacement is the same legal entity. Values above 1 pin that the
     // invoice and arrival-number series continue rather than silently restart.
+    // onboarding_complete / onboarding_step 4 is what company creation writes:
+    // the source here is an onboarded company that finished its setup checklist.
     const sieImportId = randomUUID()
     await getPool().query(
       `INSERT INTO public.sie_imports
@@ -957,6 +1043,9 @@ describe('company migration reset RPCs (pg)', () => {
         next_invoice_number: number
         next_arrival_number: number
         onboarding_complete: boolean
+        onboarding_step: number
+        initial_setup_path: string | null
+        initial_setup_completed_at: string | null
       }>(
         `SELECT
            (SELECT company_id::text FROM public.provider_consents WHERE id = $2) AS provider_company_id,
@@ -969,7 +1058,10 @@ describe('company migration reset RPCs (pg)', () => {
            (SELECT count(*)::int FROM public.company_inboxes WHERE company_id = $1 AND status = 'active') AS replacement_active_inboxes,
            (SELECT next_invoice_number::int FROM public.company_settings WHERE company_id = $1) AS next_invoice_number,
            (SELECT next_arrival_number::int FROM public.company_settings WHERE company_id = $1) AS next_arrival_number,
-           (SELECT onboarding_complete FROM public.company_settings WHERE company_id = $1) AS onboarding_complete`,
+           (SELECT onboarding_complete FROM public.company_settings WHERE company_id = $1) AS onboarding_complete,
+           (SELECT onboarding_step::int FROM public.company_settings WHERE company_id = $1) AS onboarding_step,
+           (SELECT initial_setup_path FROM public.company_settings WHERE company_id = $1) AS initial_setup_path,
+           (SELECT initial_setup_completed_at::text FROM public.company_settings WHERE company_id = $1) AS initial_setup_completed_at`,
         [replacementId, consentId, userId, companyId, inviteId],
       )
       expect(operational.rows[0]).toEqual({
@@ -982,7 +1074,16 @@ describe('company migration reset RPCs (pg)', () => {
         replacement_active_inboxes: 1,
         next_invoice_number: 41,
         next_arrival_number: 17,
-        onboarding_complete: false,
+        // The replacement carries a copy of every answer onboarding collects,
+        // so it inherits "onboarded". A forced false here sent the owner from
+        // Hem ("Att göra") into the create-a-new-company journey, a state
+        // nothing in the product could ever leave (20260920190800).
+        onboarding_complete: true,
+        onboarding_step: 4,
+        // The setup checklist re-opens instead: it is the guide for filling
+        // the company again, and unlike the flag above it can be completed.
+        initial_setup_path: null,
+        initial_setup_completed_at: null,
       })
 
       const replacementTrial = await client.query<{ capability_key: string; expires_at: string }>(

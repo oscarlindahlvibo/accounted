@@ -1,0 +1,224 @@
+import type { SupabaseClient } from '@supabase/supabase-js'
+import type { ApiKeyScope } from '@/lib/auth/api-keys'
+// Pure data module (no server imports): the same classifier the settings UI
+// and the v1 REST wrapper use, so "what counts as a write" has one owner.
+import { scopeKind } from '@/lib/auth/scope-catalog'
+import { getMultiUserState, isMembershipDormant } from '@/lib/entitlements/multi-user'
+import type { CompanyRole } from '@/types'
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+const COMPANY_INDEPENDENT_TOOLS = new Set([
+  'gnubok_search_tools',
+  'gnubok_list_skills',
+  'gnubok_load_skill',
+  'gnubok_list_companies',
+  // Creates the company: by definition it runs before one exists.
+  'gnubok_create_company',
+  // Public-registry lookup that feeds gnubok_create_company: same pre-company
+  // stage of onboarding, no company data touched at all.
+  'gnubok_lookup_company',
+])
+
+/**
+ * Company-independent tools that still USE a company when one is available:
+ * they run without one (anonymous or not-yet-onboarded callers, issue #1814)
+ * but accept an explicit company_id, which is then membership-checked like
+ * on any company-dependent tool. gnubok_list_skills filters skills by the
+ * company's entity type, employees and VAT registration.
+ */
+const OPTIONAL_COMPANY_TOOLS = new Set(['gnubok_list_skills', 'gnubok_load_skill'])
+
+export function isOptionalCompanyTool(toolName: string): boolean {
+  return OPTIONAL_COMPANY_TOOLS.has(toolName)
+}
+
+const COMPANY_ID_INPUT_PROPERTY = {
+  type: 'string',
+  format: 'uuid',
+  description: 'Target company ID. Omit for default.',
+} as const
+
+interface McpCompanyContext {
+  companyId: string
+  role: CompanyRole
+  isDefault: boolean
+}
+
+interface ToolSchemaSource {
+  name: string
+  inputSchema: Record<string, unknown>
+}
+
+export function codedError(
+  code: 'VALIDATION_ERROR' | 'NOT_FOUND' | 'FORBIDDEN' | 'INTERNAL_ERROR' | 'NO_COMPANY_YET',
+  message: string
+) {
+  return Object.assign(new Error(message), { code })
+}
+
+/**
+ * Thrown when a company-scoped operation runs on a key whose user has no
+ * company at all (minted from the OAuth popup before onboarding, issue
+ * #1814). Maps to the NO_COMPANY_YET structured error with its remediation.
+ */
+export function noCompanyYetError(): Error {
+  return codedError(
+    'NO_COMPANY_YET',
+    'This account has no company yet. Create the company in the web app, then retry.'
+  )
+}
+
+function isCompanyRole(value: unknown): value is CompanyRole {
+  return value === 'owner' || value === 'admin' || value === 'member' || value === 'viewer'
+}
+
+export function isCompanyDependentTool(toolName: string): boolean {
+  return !COMPANY_INDEPENDENT_TOOLS.has(toolName)
+}
+
+/**
+ * Does a tool that requires `scope` change tenant state?
+ *
+ * Every scope that is not `:read` counts: `:write`, `:approve`, `:manage` and
+ * `:signoff` today (sign-off attests on the company's behalf, a write for the
+ * role guard even though the scope is deliberately not `:write`), and any
+ * suffix added later. Deriving from `scopeKind` instead of an allowlist of
+ * suffixes means a new elevated scope is write-gated for viewers by default
+ * rather than silently open until someone remembers this function.
+ *
+ * `undefined` (a tool absent from TOOL_SCOPE_MAP) is not a tenant write: the
+ * unscoped tools are discovery, skills and the feedback channel, and
+ * strict-schemas.test.ts pins that every write-annotated tool has a scope.
+ */
+export function isTenantWriteScope(scope: ApiKeyScope | undefined): boolean {
+  return scope !== undefined && scopeKind(scope) === 'write'
+}
+
+export function projectToolInputSchema(tool: ToolSchemaSource): Record<string, unknown> {
+  if (!isCompanyDependentTool(tool.name) && !isOptionalCompanyTool(tool.name)) return tool.inputSchema
+
+  const properties =
+    tool.inputSchema.properties && typeof tool.inputSchema.properties === 'object'
+      ? (tool.inputSchema.properties as Record<string, unknown>)
+      : {}
+
+  return {
+    ...tool.inputSchema,
+    properties: {
+      ...properties,
+      company_id: COMPANY_ID_INPUT_PROPERTY,
+    },
+  }
+}
+
+export function extractRequestedCompany(
+  rawArgs: Record<string, unknown>
+): { requestedCompanyId: string | undefined; toolArgs: Record<string, unknown> } {
+  const { company_id: rawCompanyId, ...toolArgs } = rawArgs
+  if (rawCompanyId === undefined) return { requestedCompanyId: undefined, toolArgs }
+  if (typeof rawCompanyId !== 'string' || !UUID_PATTERN.test(rawCompanyId)) {
+    throw codedError('VALIDATION_ERROR', 'company_id must be a valid UUID')
+  }
+  return { requestedCompanyId: rawCompanyId, toolArgs }
+}
+
+export async function resolveMcpCompanyContext(args: {
+  supabase: SupabaseClient
+  userId: string
+  /** null while the key's user has no company (see validateApiKey). */
+  defaultCompanyId: string | null
+  requestedCompanyId?: string
+}): Promise<McpCompanyContext> {
+  const companyId = args.requestedCompanyId ?? args.defaultCompanyId
+  if (!companyId) {
+    throw noCompanyYetError()
+  }
+
+  const { data: membership, error } = await args.supabase
+    .from('company_members')
+    .select('company_id, role, companies!inner(archived_at)')
+    .eq('user_id', args.userId)
+    .eq('company_id', companyId)
+    .is('companies.archived_at', null)
+    .maybeSingle()
+
+  if (error) {
+    throw codedError('INTERNAL_ERROR', `Failed to resolve company membership: ${error.message}`)
+  }
+  if (!membership) {
+    throw codedError('NOT_FOUND', 'Company not found')
+  }
+  if (!isCompanyRole(membership.role)) {
+    throw codedError('FORBIDDEN', 'Company membership has an unsupported role')
+  }
+
+  // Multi-user seat gate: the MCP surface is a chokepoint like the HTTP
+  // routes, so a non-owner membership in a frozen company (multi_user lapsed
+  // past its 20-day grace) is refused here, before any tool touches tenant
+  // data. Owners always pass; self-hosted/dev return 'entitled' outright.
+  if (membership.role !== 'owner') {
+    const access = await getMultiUserState(args.supabase, companyId)
+    if (isMembershipDormant(membership.role, access.state)) {
+      throw codedError(
+        'FORBIDDEN',
+        'This company is paused for your account: multiple users require a paid plan. Ask the company owner to upgrade.'
+      )
+    }
+  }
+
+  return {
+    companyId,
+    role: membership.role,
+    isDefault: companyId === args.defaultCompanyId,
+  }
+}
+
+/**
+ * Read-only role gate for the MCP tools/call path.
+ *
+ * Called by the dispatcher (server.ts, tools/call) right after
+ * `resolveMcpCompanyContext` for every company-scoped call, including calls
+ * routed through the gnubok_call_tool bridge, and before execute(). The MCP
+ * surface runs as the service role, so RLS never sees the viewer: this is
+ * the only place the role is enforced for API-key callers. Read tools pass
+ * unchanged; a viewer's key with write scopes is still refused, because the
+ * key's scopes bound what the key MAY do and the role bounds what the user
+ * may do, and the effective permission is the intersection.
+ */
+export function assertMcpCompanyWriteAccess(
+  context: McpCompanyContext,
+  scope: ApiKeyScope | undefined
+): void {
+  if (context.role === 'viewer' && isTenantWriteScope(scope)) {
+    throw codedError(
+      'FORBIDDEN',
+      `This company membership is read-only (viewer): tools that require the "${scope}" scope change company data and are refused. Use read tools only, or ask a company owner or admin to change the role.`
+    )
+  }
+}
+
+export function addCompanyToNextHint(next: unknown, companyId: string): unknown {
+  if (!next || typeof next !== 'object' || Array.isArray(next)) return next
+  const hint = next as Record<string, unknown>
+  if (typeof hint.tool !== 'string' || !isCompanyDependentTool(hint.tool)) return next
+  const args =
+    hint.args && typeof hint.args === 'object' && !Array.isArray(hint.args)
+      ? (hint.args as Record<string, unknown>)
+      : {}
+  return {
+    ...hint,
+    args: { ...args, company_id: companyId },
+  }
+}
+
+export function addCompanyToTopLevelNext(result: unknown, companyId: string): unknown {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result
+  const record = result as Record<string, unknown>
+  if (!record.next) return result
+  return {
+    ...record,
+    next: addCompanyToNextHint(record.next, companyId),
+  }
+}

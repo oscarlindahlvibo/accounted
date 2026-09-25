@@ -23,21 +23,69 @@ Cursor-paginated invoice list ordered by created_at DESC, id ASC (newest-registe
 - Credit notes appear with status=credited and a credited_invoice_id field on the detail endpoint.
 - Ordering is by created_at (registration time), not invoice_date. Backdated invoices therefore appear where they were created, not where their date falls: filter on ?date_from / ?date_to when you care about the business date.
 - Cursor pagination: pass ?cursor=<next_cursor> from the previous response. A stale or tampered cursor is ignored and the first page is returned again.
+- Quotes (document_type=quote, offert) carry valid_until and quote_status (open | accepted | declined | expired). "expired" is derived: an open quote past valid_until; filter with ?quote_status=expired. Quotes never book and are never payable: convert an accepted quote to an invoice in the dashboard first.
+- The register only contains invoices created in Accounted. A company migrated or backfilled mid-year has real customer invoices that exist only as journal entries and are NOT in this list. Check meta.coverage: when has_pre_register_invoices is true, treat periods before covers_from as not answered by this endpoint (query journal entries instead).
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `status` | query | `"draft" \| "sent" \| "paid" \| "partially_paid" \| "overdue" \| "cancelled" \| "credited"` | no | Only invoices in this status. |
+| `customer_id` | query | `string` | no | Only invoices to this customer (id). |
+| `document_type` | query | `"invoice" \| "proforma" \| "delivery_note" \| "quote"` | no | Only this document type. Default: every type. |
+| `quote_status` | query | `"open" \| "accepted" \| "declined" \| "expired"` | no | Quotes only (implies document_type=quote). expired = open with valid_until before today. |
+| `currency` | query | `string` | no | 3-letter ISO 4217 code, uppercase (e.g. SEK, EUR). |
+| `date_from` | query | `string` | no | YYYY-MM-DD. Invoices with invoice_date on or after this date. |
+| `date_to` | query | `string` | no | YYYY-MM-DD. Invoices with invoice_date on or before this date. |
+| `cursor` | query | `string` | no | Opaque cursor from the previous page's meta.next_cursor. Omit for the first page. |
+| `limit` | query | `number` | no | Page size, 1-100 (default 50). Larger values are clamped to 100. |
+| `expand` | query | `string` | no | Comma-separated related records to embed: customer, items. An unknown key returns 400 VALIDATION_ERROR. |
 
 Response `200`:
 ```ts
 {
-  data: { id: string, invoice_number: string, customer_id: string, customer_name: string, invoice_date: string, due_date: string, status: "draft" | "sent" | "paid" | "partially_paid" | "overdue" | "cancelled" | "credited", document_type: "invoice" | "proforma" | "delivery_note", currency: string, subtotal: number, vat_amount: number, total: number, remaining_amount: number, paid_at: string, created_at: string }[],
+  data: { id: string, invoice_number: string | null, customer_id: string, customer_name: string, invoice_date: string, due_date: string, status: "draft" | "sent" | "paid" | "partially_paid" | "overdue" | "cancelled" | "credited", document_type: "invoice" | "proforma" | "delivery_note" | "quote", valid_until: string | null, quote_status: "open" | "accepted" | "declined" | "expired" | null, currency: string, subtotal: number, vat_amount: number, total: number, remaining_amount: number, paid_at: string | null, created_at: string }[],
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": [
+    {
+      "id": "0e9c…",
+      "invoice_number": "2026-0042",
+      "customer_id": "a8f1…",
+      "customer_name": "Acme AB",
+      "invoice_date": "2026-05-01",
+      "due_date": "2026-05-31",
+      "status": "sent",
+      "document_type": "invoice",
+      "currency": "SEK",
+      "subtotal": 10000,
+      "vat_amount": 2500,
+      "total": 12500,
+      "remaining_amount": 12500,
+      "paid_at": null,
+      "created_at": "2026-05-01T09:14:33Z"
+    }
+  ],
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12",
+    "next_cursor": null,
+    "coverage": {
+      "covers_from": "2026-05-01",
+      "has_pre_register_invoices": true
+    }
   }
 }
 ```
@@ -60,14 +108,17 @@ Creates an invoice in draft status. The F-series invoice_number is allocated ato
 - Non-SEK currencies require an active Riksbanken exchange-rate fetch. Failure is non-fatal: the invoice is created with null SEK fields and the agent can recompute later.
 - invoice_number is null on creation. The number is allocated atomically when the invoice transitions out of draft. Counting on a specific number at create time is a bug.
 - document_type='delivery_note' produces no VAT and a different number sequence (D-series). Most use cases want the default document_type='invoice'.
+- document_type='quote' (offert) requires valid_until (YYYY-MM-DD, the expiry; due_date mirrors it). A quote is numbered OF-nnn from its own series at create, starts as quote_status='open', never posts a journal entry, never emits invoice.created and cannot be sent-and-booked or paid: record the customer decision with POST /invoices/{id}/quote-status and convert an accepted quote to an invoice in the dashboard.
 - is_self_billed=true registers a self-billing invoice your CUSTOMER issued on your behalf (a sale for you). It is booked immediately (not a draft, no F-number), so external_invoice_number and received_date are required and it is NOT dry-run-free of side effects on the live call. Do NOT set it for a normal invoice you issue yourself.
 - Project/cost-center tagging: pass default_dimensions ({"6":"P001"} = project, {"1":"KS01"} = kostnadsställe) for the whole invoice and/or items[].dimensions per line (per-line wins per key). Tags are stored on the draft and applied to the journal entry lines when the invoice is sent. When the company has the dimension registry enabled, unknown or archived codes are rejected at :send with 400 DIMENSION_VALIDATION_FAILED — list valid codes via GET /dimensions.
 - ROT/RUT: set items[].deduction_type ("rot"|"rut") on labor lines plus labor_hours and work_type (Skatteverket arbetstypskod). The invoice must carry deduction_personnummer AND housing info: deduction_housing_designation (fastighetsbeteckning) for småhus, or deduction_apartment_number + deduction_brf_org_number for bostadsrätt. deduction_amount is computed server-side and cannot be set by the caller; the response exposes deduction_total and remaining_amount = total - deduction_total (Skatteverket pays the rest via 1513). Validation failures return 400 INVOICE_CREATE_ROT_RUT_VALIDATION.
 - Articles: pass items[].article_id (from the artikelregister, GET /articles) to link a line to a catalog article; price/description are still taken from the request body (the API never auto-fills from the article: send the values you want on the invoice). items[].revenue_account is the legacy wire name for an optional BAS class 1-3 posting-account override and is validated against the chart of accounts.
+- EU customers: reverse charge (0 %, ruta 39) needs customer_type eu_business, a VIES-validated vat_number and a country other than SE. When any of those is missing the invoice is created WITH Swedish VAT and the 201 carries meta.warnings (codes EU_BUSINESS_VAT_NUMBER_NOT_VALIDATED, EU_BUSINESS_VAT_NUMBER_MISSING, EU_BUSINESS_COUNTRY_IS_SE, each with a remediation). A Swedish rate set explicitly on a line to a validated EU or non-EU business is accepted (taxed-where-performed supplies) but flagged as SWEDISH_VAT_TO_REVERSE_CHARGE_CUSTOMER / SWEDISH_VAT_TO_EXPORT_CUSTOMER. Warnings never fail the request; read them before sending. Dry-run returns the same list.
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
@@ -76,10 +127,12 @@ Request body:
   invoice_date: string,
   due_date: string,
   delivery_date?: string | "",
-  currency: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK",
-  document_type?: "invoice" | "proforma" | "delivery_note",
+  currency: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK" | "CHF",
+  document_type?: "invoice" | "proforma" | "delivery_note" | "quote",
+  valid_until?: string | "",
   your_reference?: string,
   our_reference?: string,
+  invoice_marking?: string,
   notes?: string,
   payment_link_url?: string | "",
   payment_link_auto?: boolean,
@@ -94,7 +147,26 @@ Request body:
   external_invoice_number?: string | "",
   self_billing_agreement_ref?: string,
   received_date?: string | "",
-  items: { line_type?: "product" | "text", description: string, quantity: number, unit: string, unit_price: number, vat_rate?: number, article_id?: string, revenue_account?: string, deduction_type?: "rot" | "rut", labor_hours?: number, work_type?: string, housing_designation?: string, apartment_number?: string, brf_org_number?: string | "", accrual_period_start?: string, accrual_period_end?: string, accrual_balance_account?: string, dimensions?: Record<string, string> }[]
+  payment_cash_account_id?: string | "" | null,
+  items: { line_type?: "product" | "text", description: string, quantity: number, unit: string, unit_price: number, discount_percent?: number | null, vat_rate?: number, article_id?: string | null, revenue_account?: string | null, sales_order_item_id?: string | null, deduction_type?: "rot" | "rut" | null, labor_hours?: number | null, work_type?: string | null, housing_designation?: string | null, apartment_number?: string | null, brf_org_number?: string | "" | null, accrual_period_start?: string | null, accrual_period_end?: string | null, accrual_balance_account?: string | null, dimensions?: Record<string, string> }[]
+}
+```
+
+Example request:
+```json
+{
+  "customer_id": "a8f1…",
+  "invoice_date": "2026-05-12",
+  "due_date": "2026-06-11",
+  "currency": "SEK",
+  "items": [
+    {
+      "description": "Konsultation",
+      "quantity": 8,
+      "unit": "tim",
+      "unit_price": 1250
+    }
+  ]
 }
 ```
 
@@ -103,12 +175,14 @@ Response `200`:
 {
   data: {
     id: string,
-    invoice_number: string,
+    invoice_number: string | null,
     customer_id: string,
     invoice_date: string,
     due_date: string,
     status: string,
     document_type: string,
+    valid_until?: string | null,
+    quote_status?: string | null,
     currency: string,
     subtotal: number,
     vat_amount: number,
@@ -119,9 +193,34 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "invoice_number": null,
+    "customer_id": "a8f1…",
+    "invoice_date": "2026-05-12",
+    "due_date": "2026-06-11",
+    "status": "draft",
+    "currency": "SEK",
+    "subtotal": 10000,
+    "vat_amount": 2500,
+    "total": 12500,
+    "remaining_amount": 12500
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -146,30 +245,62 @@ Returns the full invoice record with the customer embedded. Pass ?expand=items f
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `expand` | query | `string` | no | Comma-separated related records to embed: items, payments. An unknown key returns 400 VALIDATION_ERROR. |
 
 Response `200`:
 ```ts
 {
   data: {
     id: string,
-    invoice_number: string,
+    invoice_number: string | null,
     customer_id: string,
     invoice_date: string,
     due_date: string,
     status: string,
     document_type: string,
+    valid_until?: string | null,
+    quote_status?: string | null,
+    quote_decided_at?: string | null,
     currency: string,
     total: number,
     remaining_amount: number,
-    paid_at: string,
+    paid_at: string | null,
     created_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "invoice_number": "2026-0042",
+    "customer_id": "a8f1…",
+    "customer": {
+      "id": "a8f1…",
+      "name": "Acme AB"
+    },
+    "invoice_date": "2026-05-01",
+    "due_date": "2026-05-31",
+    "status": "sent",
+    "total": 12500,
+    "remaining_amount": 12500,
+    "paid_at": null,
+    "created_at": "2026-05-01T09:14:33Z"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -188,15 +319,17 @@ Partial update for invoices in draft status. Allowed fields: invoice_date, due_d
 
 **Pitfalls:**
 - Idempotency-Key is mandatory.
-- A 409 INVOICE_UPDATE_NOT_DRAFT means the invoice has been sent / paid / credited / cancelled. The error code name is shared with the DELETE handler.
+- A 409 INVOICE_UPDATE_NOT_DRAFT means the invoice has been sent / paid / credited / cancelled. The DELETE handler on this path uses its own code, INVOICE_DELETE_NOT_DRAFT.
 - items is a FULL REPLACE (no per-line merge): send the complete new line set, minimum one item. Omitting items keeps the current lines untouched. VAT rates are re-validated against the customer type and totals are recomputed server-side.
 - items are always built against the invoice's EXISTING customer: customer_id cannot change on PATCH.
 - default_dimensions replaces the entire bag (no per-key merge): read the current value first if you want to add a tag. Send {} to clear all tags. Codes are validated against the dimension registry at :send, not at PATCH time.
+- When items are replaced, the VAT treatment is decided again from the customer's current row (customer_type, vat_number validation, country), so it can differ from the draft's stored one: an eu_business whose country is SE gets Swedish VAT, never reverse charge. The 200 may carry meta.warnings about the treatment (same codes as POST /invoices: EU_BUSINESS_VAT_NUMBER_NOT_VALIDATED, EU_BUSINESS_VAT_NUMBER_MISSING, EU_BUSINESS_COUNTRY_IS_SE, SWEDISH_VAT_TO_REVERSE_CHARGE_CUSTOMER, SWEDISH_VAT_TO_EXPORT_CUSTOMER). The update succeeded; the warning says why the rates are what they are.
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
@@ -208,7 +341,16 @@ Request body:
   our_reference?: string | unknown,
   notes?: string | unknown,
   default_dimensions?: Record<string, string>,
-  items?: { line_type?: "product" | "text", description: string, quantity: number, unit: string, unit_price: number, vat_rate?: number, article_id?: string, revenue_account?: string, deduction_type?: "rot" | "rut", labor_hours?: number, work_type?: string, housing_designation?: string, apartment_number?: string, brf_org_number?: string | "", accrual_period_start?: string, accrual_period_end?: string, accrual_balance_account?: string, dimensions?: Record<string, string> }[]
+  payment_cash_account_id?: string | unknown,
+  items?: { line_type?: "product" | "text", description: string, quantity: number, unit: string, unit_price: number, discount_percent?: number | null, vat_rate?: number, article_id?: string | null, revenue_account?: string | null, sales_order_item_id?: string | null, deduction_type?: "rot" | "rut" | null, labor_hours?: number | null, work_type?: string | null, housing_designation?: string | null, apartment_number?: string | null, brf_org_number?: string | "" | null, accrual_period_start?: string | null, accrual_period_end?: string | null, accrual_balance_account?: string | null, dimensions?: Record<string, string> }[]
+}
+```
+
+Example request:
+```json
+{
+  "due_date": "2026-07-15",
+  "notes": "Förlängd förfallotid"
 }
 ```
 
@@ -217,24 +359,99 @@ Response `200`:
 {
   data: {
     id: string,
-    invoice_number: string,
+    invoice_number: string | null,
     customer_id: string,
     invoice_date: string,
     due_date: string,
     status: string,
     document_type: string,
+    valid_until?: string | null,
+    quote_status?: string | null,
+    quote_decided_at?: string | null,
     currency: string,
     total: number,
     remaining_amount: number,
-    paid_at: string,
+    paid_at: string | null,
     created_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "status": "draft",
+    "due_date": "2026-07-15",
+    "notes": "Förlängd förfallotid"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
+  }
+}
+```
+
+---
+
+### `DELETE /api/v1/companies/{companyId}/invoices/{id}`
+
+**Delete a draft invoice (hard delete if unnumbered, makulering if numbered).**
+`scope:invoices:write · risk:high · dry-run`
+
+Removes an invoice in draft status. An unnumbered draft (never finalized: no F-series number was consumed) is hard deleted and responds { deleted: true }; its line items cascade. A numbered draft is makulerad: the row and its number are retained, status flips to cancelled, and the response is { cancelled: true, invoice_number } so the F-series stays gap-free per ML 17 kap 24 and BFNAR 2013:2. Returns 409 INVOICE_DELETE_NOT_DRAFT for any non-draft status: sent / paid / credited invoices are immutable and must be reversed via a credit note. Requires Idempotency-Key; dry-runnable.
+
+**Use when:** You created a draft by mistake, or want to discard a draft instead of sending it. Check the response shape: deleted means the row is gone, cancelled means it survives as makulerad with its number.
+**Do not use for:** Withdrawing a sent / paid invoice (issue a credit note via POST /:id/credit). Editing a draft (use PATCH). Cancelling recurring schedules.
+
+**Pitfalls:**
+- Idempotency-Key is mandatory. A repeated DELETE with a fresh key returns 404 for a hard-deleted draft (the row is gone) and 409 INVOICE_DELETE_NOT_DRAFT for a makulerad one (status is now cancelled).
+- 409 INVOICE_DELETE_NOT_DRAFT means the invoice left draft status: it is immutable and can only be reversed via a credit note.
+- 409 INVOICE_CANCEL_RACE means the invoice was finalized or sent concurrently: re-read the invoice before retrying.
+- The hard-delete path emits an invoice.draft_deleted audit event; the makulering path leaves its trail in the invoice row itself.
+
+| Parameter | In | Type | Required | Notes |
+|---|---|---|---|---|
+| `companyId` | path | `string` | yes |  |
+| `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
+
+Response `200`:
+```ts
+{
+  data: { deleted?: boolean, cancelled?: boolean, invoice_number?: string },
+  meta: {
+    request_id: string,
+    api_version: string,
+    next_cursor?: string | null,
+    audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "cancelled": true,
+    "invoice_number": "2026-0042"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -246,7 +463,7 @@ Response `200`:
 **Issue a credit note (kreditfaktura) against an invoice.**
 `scope:invoices:write · risk:high · idempotent · dry-run`
 
-Creates a credit note referencing the original invoice. The credit note carries reversed-sign amounts (matching the original line for line) and gets invoice_number=KR-<original>. The original invoice transitions to status=credited. Under faktureringsmetoden, posts a reversing journal entry (Credit AR 1510 / Debit revenue + Debit output VAT). Under kontantmetoden the credit note still creates the row but defers the reversal entry until refund. Idempotent and dry-runnable. Emits invoice.credited.
+Creates a credit note referencing the original invoice. The credit note carries reversed-sign amounts (matching the original line for line) and gets invoice_number=KR-<original>. The original invoice transitions to status=credited. Posts a reversing journal entry (Debit revenue + Debit output VAT / Credit AR 1510) whenever the original sale reached the ledger: always under faktureringsmetoden, and under kontantmetoden once the original was paid or otherwise booked (status paid, a linked verifikat, a payment date, or a non-zero paid amount). Only a kontantmetod invoice carrying none of those signals is credited without an entry, because nothing has been recognised yet. The credit note is dated today (Europe/Stockholm); a locked or closed period returns 400 INVOICE_CREDIT_PERIOD_LOCKED. Idempotent and dry-runnable. Emits credit_note.created.
 
 **Use when:** You need to legally cancel an issued invoice (ML 17 kap 22-23§). The original invoice cannot be edited once issued: credit it and reissue corrected.
 **Do not use for:** Cancelling a draft (DELETE the draft instead). Refunding a partial payment without invalidating the whole invoice (book the refund manually via the journal-entries API in a future PR).
@@ -255,16 +472,24 @@ Creates a credit note referencing the original invoice. The credit note carries 
 - Idempotency-Key is mandatory. Retried credits with the same key replay the cached response: no duplicate credit note is created.
 - The original invoice must be in sent / paid / overdue status. Drafts, cancelled invoices, and already-credited invoices are rejected with specific error codes.
 - Credit-note items mirror the original's lines with negated values. To credit only part of an invoice (line-level), credit the full invoice first then reissue with the corrected lines.
-- Under kontantmetoden no journal entry is created here: refund booking is deferred. A `JOURNAL_ENTRY_NOT_POSTED` warning is NOT emitted in this case (the deferral is correct, not a failure).
+- Under kontantmetoden a journal entry is posted only when the original carries a booking signal (status paid, a linked verifikat, a payment date, or a non-zero paid amount): crediting an invoice with none of those creates the row without an entry, and no `JOURNAL_ENTRY_NOT_POSTED` warning is emitted (the deferral is correct, not a failure). Use the dry run to read `would_create_journal_entry` before committing.
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
 { reason?: string }
+```
+
+Example request:
+```json
+{
+  "reason": "Felaktig kund"
+}
 ```
 
 Response `200`:
@@ -276,15 +501,35 @@ Response `200`:
     credited_invoice_id: string,
     status: "sent",
     total: number,
-    journal_entry_id: string,
+    journal_entry_id: string | null,
     warnings?: { code: string, message: string }[]
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "ccccccc-c…",
+    "invoice_number": "KR-2026-0042",
+    "credited_invoice_id": "0e9c…",
+    "status": "sent",
+    "total": -12500,
+    "journal_entry_id": "8b4b…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -313,6 +558,7 @@ Marks a sent / overdue invoice as paid (or partially_paid). Books the payment vi
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
@@ -322,6 +568,13 @@ Request body:
   notes?: string,
   lines?: { account_number: string, debit_amount?: number, credit_amount?: number, line_description?: string, dimensions?: Record<string, string> }[],
   force?: boolean
+}
+```
+
+Example request:
+```json
+{
+  "payment_date": "2026-05-12"
 }
 ```
 
@@ -335,16 +588,38 @@ Response `200`:
     total: number,
     paid_amount: number,
     remaining_amount: number,
-    paid_at: string,
-    journal_entry_id: string,
+    paid_at: string | null,
+    journal_entry_id: string | null,
     warnings?: { code: string, message: string }[]
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "invoice_number": "2026-0042",
+    "status": "paid",
+    "total": 12500,
+    "paid_amount": 12500,
+    "remaining_amount": 0,
+    "paid_at": "2026-05-12",
+    "journal_entry_id": "7b3a…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -356,9 +631,9 @@ Response `200`:
 **Transition a draft invoice to sent (without emailing).**
 `scope:invoices:write · risk:medium · idempotent · dry-run`
 
-Marks a draft invoice as sent: for invoices delivered outside Accounted (Peppol, postal, manual email). Allocates the F-series invoice_number atomically (ML 17 kap 24§ p.2). When the company books at issue (faktureringsmetoden without defer_invoice_booking), also posts the invoice journal entry (Debit AR 1510 / Credit revenue + output VAT). Emits invoice.sent. Idempotent and dry-runnable. The companion :send action (PR-B-2b-3) adds PDF rendering and email delivery on top of this same flow.
+Marks a draft invoice as sent: for invoices delivered outside Accounted (an external e-invoice provider, postal, manual email). Not needed after a successful dashboard Peppol send: that flow issues the invoice itself. If the dashboard reports that the invoice was sent via Peppol but could not be marked as sent (the send response carried issuance.ok=false and the invoice is still in draft), :mark-sent is the documented recovery and completes the issuance; a number already allocated is reused, never consumed twice. Peppol sending lives in the dashboard invoice page behind a per-company access grant (requested under Inställningar > Fakturering (Settings > Invoicing); aktiebolag senders, standard invoices only, Swedish org-number buyers whose org number is not a personnummer, SEK with taxable Swedish VAT at 6/12/25 % only, no ROT/RUT deductions); a v1 or MCP Peppol send action is not yet available. Allocates the F-series invoice_number atomically (ML 17 kap 24§ p.2). When the company books at issue (faktureringsmetoden without defer_invoice_booking), also posts the invoice journal entry (Debit AR 1510 / Credit revenue + output VAT). Emits invoice.sent. Idempotent and dry-runnable. The companion :send action (PR-B-2b-3) adds PDF rendering and email delivery on top of this same flow.
 
-**Use when:** You delivered the invoice through a channel other than Accounted's email (Peppol, postal, your own SMTP) and need to record it as sent so the F-series number is allocated and the journal entry is posted.
+**Use when:** You delivered the invoice through a channel other than Accounted's email or a successful dashboard Peppol send (an external e-invoice provider, postal, your own SMTP) and need to record it as sent so the F-series number is allocated and the journal entry is posted; or a dashboard Peppol send was accepted by the network but reported that the invoice could not be marked as sent.
 **Do not use for:** Sending the invoice via Accounted email: use :send (PR-B-2b-3) for that. Marking an already-sent invoice as paid: use :mark-paid (PR-B-2b-2).
 
 **Pitfalls:**
@@ -371,6 +646,7 @@ Marks a draft invoice as sent: for invoices delivered outside Accounted (Peppol,
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Response `200`:
 ```ts
@@ -380,15 +656,34 @@ Response `200`:
     invoice_number: string,
     status: "sent",
     total: number,
-    journal_entry_id: string,
+    journal_entry_id: string | null,
     warnings?: { code: string, message: string }[]
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "invoice_number": "2026-0042",
+    "status": "sent",
+    "total": 12500,
+    "journal_entry_id": "7b3a…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -419,19 +714,101 @@ Response `200` (`application/pdf`).
 
 ---
 
+### `POST /api/v1/companies/{companyId}/invoices/{id}/quote-status`
+
+**Record the customer decision on a quote (offert).**
+`scope:invoices:write · risk:low · idempotent · dry-run · reversible`
+
+Sets quote_status on a quote (document_type=quote) to open, accepted or declined. Any transition between the three is allowed until the quote has been converted to an invoice; after that the decision is locked (409 INVOICE_QUOTE_ALREADY_INVOICED). "expired" is never written: it is derived from valid_until and reported as effective_quote_status. Accepting a quote past valid_until is allowed (pass valid_until here to extend an expired quote so it reads as open again). No journal entry, number allocation or event is involved. Idempotent and dry-runnable.
+
+**Use when:** The customer answered a quote and you want Accounted to reflect it (accepted / declined), or you want to reopen a decision that was recorded by mistake.
+**Do not use for:** Creating the invoice from an accepted quote (convert it in the dashboard; the conversion marks the quote accepted itself). Regular invoices, proformas or delivery notes: they return 400 INVOICE_NOT_A_QUOTE.
+
+**Pitfalls:**
+- Only document_type=quote rows are decidable; anything else returns 400 INVOICE_NOT_A_QUOTE.
+- A cancelled quote returns 400 INVOICE_QUOTE_NOT_DECIDABLE.
+- Once an active invoice exists with converted_from_id = this quote, the decision is locked: 409 INVOICE_QUOTE_ALREADY_INVOICED. Cancelling that invoice frees the quote again.
+- Setting status=open clears quote_decided_at; accepted/declined stamp it with the request time.
+- Idempotency-Key is mandatory. A retried call with the same key replays the cached response.
+
+| Parameter | In | Type | Required | Notes |
+|---|---|---|---|---|
+| `companyId` | path | `string` | yes |  |
+| `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
+
+Request body:
+```ts
+{ status: "open" | "accepted" | "declined", valid_until?: string | "" }
+```
+
+Example request:
+```json
+{
+  "status": "accepted"
+}
+```
+
+Response `200`:
+```ts
+{
+  data: {
+    id: string,
+    invoice_number: string | null,
+    document_type: "quote",
+    status: string,
+    quote_status: "open" | "accepted" | "declined",
+    effective_quote_status: "open" | "accepted" | "declined" | "expired",
+    quote_decided_at: string | null,
+    valid_until: string | null
+  },
+  meta: {
+    request_id: string,
+    api_version: string,
+    next_cursor?: string | null,
+    audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "invoice_number": "OF-007",
+    "document_type": "quote",
+    "status": "sent",
+    "quote_status": "accepted",
+    "effective_quote_status": "accepted",
+    "quote_decided_at": "2026-09-02T09:14:33Z",
+    "valid_until": "2026-09-30"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
+  }
+}
+```
+
+---
+
 ### `POST /api/v1/companies/{companyId}/invoices/{id}/send`
 
 **Send a draft invoice to the customer by email.**
 `scope:invoices:write · risk:high · idempotent · dry-run`
 
-The full send pipeline: preflight PDF render → allocate F-series number atomically → final PDF render → email via Resend (PDF attachment, copy to company) → flip status to sent → post journal entry (real invoice, unless kontantmetoden or defer_invoice_booking) → archive PDF as underlag → emit invoice.sent. Email failure is a hard 502 before state changes; post-email failures surface as warnings but the invoice IS marked sent.
+The full send pipeline: preflight PDF render → allocate F-series number atomically → final PDF render → email via the email extension (Resend or SMTP; PDF attachment, copy to company) → flip status to sent → post journal entry (real invoice, unless kontantmetoden or defer_invoice_booking) → archive PDF as underlag → emit invoice.sent. Email failure is a hard 502 before state changes; post-email failures surface as warnings but the invoice IS marked sent.
 
-**Use when:** You want Accounted to deliver the invoice to the customer via email. For invoices delivered through another channel (Peppol, postal, own SMTP) use :mark-sent instead.
+**Use when:** You want Accounted to deliver the invoice to the customer via email. Peppol e-invoices are sent from the invoice page in the dashboard (per-company access grant requested under Inställningar > Fakturering (Settings > Invoicing); aktiebolag senders, standard invoices only, Swedish org-number buyers whose org number is not a personnummer, SEK with taxable Swedish VAT at 6/12/25 % only, no ROT/RUT deductions); a v1 or MCP Peppol send action is not yet available. A successful dashboard Peppol send issues the invoice itself, so do not call :mark-sent after it; only if the dashboard reports that the invoice was sent via Peppol but could not be marked as sent does :mark-sent complete the issuance. For invoices delivered through another channel (an external e-invoice provider, postal, own SMTP) use :mark-sent instead.
 **Do not use for:** Re-sending an already-sent invoice (returns 409 INVOICE_UPDATE_NOT_DRAFT). Sending a delivery note (no F-series lifecycle). Sending a credit note (use the :credit endpoint to issue the kreditfaktura; subsequent re-send of the credit note via :mark-sent is the supported path).
 
 **Pitfalls:**
 - Idempotency-Key is mandatory.
-- Email service must be configured: without RESEND_API_KEY + RESEND_FROM_EMAIL the endpoint returns 503 INVOICE_SEND_EMAIL_NOT_CONFIGURED.
+- Email service must be configured: without RESEND_API_KEY + RESEND_FROM_EMAIL (or an SMTP relay via EMAIL_PROVIDER=smtp) the endpoint returns 503 INVOICE_SEND_EMAIL_NOT_CONFIGURED.
 - Customer must have an email address. 400 INVOICE_SEND_NO_CUSTOMER_EMAIL otherwise.
 - A cancelled invoice is rejected (400 INVOICE_SEND_CANCELLED): its F-series number is preserved for compliance but the document is not a valid faktura.
 - Email failure before the status flip leaves the F-series number consumed but the invoice in `draft` status. Same orphan window as :mark-sent (architecturally tracked, matches internal route).
@@ -444,10 +821,23 @@ The full send pipeline: preflight PDF render → allocate F-series number atomic
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
 { additional_cc?: string[], additional_bcc?: string[] }
+```
+
+Example request:
+```json
+{
+  "additional_cc": [
+    "case-owner@company.test"
+  ],
+  "additional_bcc": [
+    "invoice-archive@company.test"
+  ]
+}
 ```
 
 Response `200`:
@@ -458,19 +848,44 @@ Response `200`:
     invoice_number: string,
     status: "sent",
     total: number,
-    message_id: string,
+    message_id: string | null,
     sent_to: string,
-    cc: string,
+    cc: string | null,
     cc_addresses: string[],
-    journal_entry_id: string,
+    journal_entry_id: string | null,
     warnings?: { code: string, message: string }[]
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "invoice_number": "2026-0042",
+    "status": "sent",
+    "total": 12500,
+    "message_id": "re_abc123",
+    "sent_to": "finance@acme.test",
+    "cc": "billing@gnubok-user.test",
+    "cc_addresses": [
+      "billing@gnubok-user.test"
+    ],
+    "journal_entry_id": "7b3a…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -492,16 +907,40 @@ Bulk-creation endpoint. Each invoice in the request array is validated and inser
 - Passing all_or_nothing: true returns 501 NOT_IMPLEMENTED. Today only partial-success batches exist; omit the flag (or pass false).
 - Each per-item invoice still goes through the same VAT-rule validation as POST /invoices. A mismatched per-item vat_rate produces a per-item failure, not a whole-batch failure.
 - Currency conversion is best-effort PER ITEM. A failed Riksbanken fetch leaves that item's SEK columns null but does NOT fail the item.
+- Quotes (document_type: quote) are refused per item as VALIDATION_ERROR: a quote carries its own OF-number, valid_until and quote_status. Create quotes one at a time with POST /invoices.
 
 | Parameter | In | Type | Required | Notes |
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
 {
-  invoices: { customer_id: string, invoice_date: string, due_date: string, delivery_date?: string | "", currency: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK", document_type?: "invoice" | "proforma" | "delivery_note", your_reference?: string, our_reference?: string, notes?: string, payment_link_url?: string | "", payment_link_auto?: boolean, deduction_personnummer?: string, deduction_housing_designation?: string, deduction_apartment_number?: string, deduction_brf_org_number?: string | "", save_as_draft?: boolean, ore_rounding?: boolean, default_dimensions?: Record<string, string>, is_self_billed?: boolean, external_invoice_number?: string | "", self_billing_agreement_ref?: string, received_date?: string | "", items: { line_type?: "product" | "text", description: string, quantity: number, unit: string, unit_price: number, vat_rate?: number, article_id?: string, revenue_account?: string, deduction_type?: "rot" | "rut", labor_hours?: number, work_type?: string, housing_designation?: string, apartment_number?: string, brf_org_number?: string | "", accrual_period_start?: string, accrual_period_end?: string, accrual_balance_account?: string, dimensions?: Record<string, string> }[] }[],
+  invoices: { customer_id: string, invoice_date: string, due_date: string, delivery_date?: string | "", currency: "SEK" | "EUR" | "USD" | "GBP" | "NOK" | "DKK" | "CHF", document_type?: "invoice" | "proforma" | "delivery_note" | "quote", valid_until?: string | "", your_reference?: string, our_reference?: string, invoice_marking?: string, notes?: string, payment_link_url?: string | "", payment_link_auto?: boolean, deduction_personnummer?: string, deduction_housing_designation?: string, deduction_apartment_number?: string, deduction_brf_org_number?: string | "", save_as_draft?: boolean, ore_rounding?: boolean, default_dimensions?: Record<string, string>, is_self_billed?: boolean, external_invoice_number?: string | "", self_billing_agreement_ref?: string, received_date?: string | "", payment_cash_account_id?: string | "" | null, items: { line_type?: "product" | "text", description: string, quantity: number, unit: string, unit_price: number, discount_percent?: number | null, vat_rate?: number, article_id?: string | null, revenue_account?: string | null, sales_order_item_id?: string | null, deduction_type?: "rot" | "rut" | null, labor_hours?: number | null, work_type?: string | null, housing_designation?: string | null, apartment_number?: string | null, brf_org_number?: string | "" | null, accrual_period_start?: string | null, accrual_period_end?: string | null, accrual_balance_account?: string | null, dimensions?: Record<string, string> }[] }[],
   all_or_nothing?: boolean
+}
+```
+
+Example request:
+```json
+{
+  "invoices": [
+    {
+      "customer_id": "a8f1…",
+      "invoice_date": "2026-05-12",
+      "due_date": "2026-06-11",
+      "currency": "SEK",
+      "items": [
+        {
+          "description": "A",
+          "quantity": 1,
+          "unit": "st",
+          "unit_price": 1000
+        }
+      ]
+    }
+  ]
 }
 ```
 
@@ -515,9 +954,40 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "results": [
+      {
+        "ok": true,
+        "request_index": 0,
+        "data": {
+          "id": "0e9c…",
+          "invoice_number": null,
+          "status": "draft",
+          "total": 1250
+        }
+      }
+    ],
+    "summary": {
+      "total": 1,
+      "succeeded": 1,
+      "failed": 0
+    }
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```

@@ -12,7 +12,7 @@ are in SKILL.md and are not repeated per endpoint.
 **Upload a document to the WORM archive.**
 `scope:documents:write · risk:medium · idempotent`
 
-Multipart upload of a document (PDF / image) under the BFL 7 kap retention regime. The bytes are hashed (SHA-256), written to Supabase Storage, and recorded in document_attachments at version=1. Allowed MIME types: application/pdf, image/jpeg, image/png, image/webp. Max size: 10 MB.
+Multipart upload of a document (PDF, image or Office file) under the BFL 7 kap retention regime. The bytes are hashed (SHA-256), written to Supabase Storage, and recorded in document_attachments at version=1. Allowed MIME types: application/pdf, image/jpeg, image/png, image/webp, image/heic, image/heif, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.openxmlformats-officedocument.presentationml.presentation, application/msword, application/vnd.ms-excel, application/vnd.ms-powerpoint, application/vnd.oasis.opendocument.text, application/vnd.oasis.opendocument.spreadsheet, application/vnd.oasis.opendocument.presentation, application/rtf, text/rtf, text/csv. Max size: 10 MB.
 
 **Use when:** You have a receipt, invoice scan, or supporting document for a posted verifikation and want it archived for the 7-year BFL retention period. Optionally link to a journal entry at upload time via journal_entry_id.
 **Do not use for:** Updating an existing document (no v1 update endpoint; new versions go through the dashboard). Bulk uploads: call once per file.
@@ -20,7 +20,7 @@ Multipart upload of a document (PDF / image) under the BFL 7 kap retention regim
 **Pitfalls:**
 - Idempotency-Key is mandatory; multipart retries with the same key replay the cached response.
 - Max size 10 MB enforced server-side: DOC_UPLOAD_TOO_LARGE on overrun.
-- Only application/pdf / image/jpeg / image/png / image/webp accepted: DOC_UPLOAD_UNSUPPORTED_TYPE otherwise.
+- Only application/pdf / image/jpeg / image/png / image/webp / image/heic / image/heif / application/vnd.openxmlformats-officedocument.wordprocessingml.document / application/vnd.openxmlformats-officedocument.spreadsheetml.sheet / application/vnd.openxmlformats-officedocument.presentationml.presentation / application/msword / application/vnd.ms-excel / application/vnd.ms-powerpoint / application/vnd.oasis.opendocument.text / application/vnd.oasis.opendocument.spreadsheet / application/vnd.oasis.opendocument.presentation / application/rtf / text/rtf / text/csv accepted: DOC_UPLOAD_UNSUPPORTED_TYPE otherwise.
 - WORM: once linked to a posted journal entry, the document row cannot be modified or deleted (DB trigger). Upload-then-link is reversible (the document exists with journal_entry_id=null until linked); once linked, treat as immutable.
 - Dry-run is not supported on this endpoint: the engine hashes + stores + inserts in one atomic flow.
 
@@ -44,22 +44,44 @@ Response `200`:
   data: {
     id: string,
     file_name: string,
-    mime_type: string,
+    mime_type: string | null,
     file_size_bytes: number,
     sha256_hash: string,
     version: number,
     is_current_version: boolean,
-    upload_source: string,
-    journal_entry_id: string,
-    journal_entry_line_id: string,
+    upload_source: string | null,
+    journal_entry_id: string | null,
+    journal_entry_line_id: string | null,
     created_at: string
   },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "file_name": "kvitto-2026-05-12.pdf",
+    "mime_type": "application/pdf",
+    "file_size_bytes": 184320,
+    "sha256_hash": "8a7f…",
+    "version": 1,
+    "is_current_version": true,
+    "journal_entry_id": "a8f1…"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -92,7 +114,7 @@ Response `200`:
   data: {
     id: string,
     file_name: string,
-    mime_type: string,
+    mime_type: string | null,
     sha256_hash: string,
     is_current_version: boolean,
     download_url: string,
@@ -101,9 +123,29 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "file_name": "kvitto-2026-05-12.pdf",
+    "mime_type": "application/pdf",
+    "sha256_hash": "8a7f…",
+    "download_url": "https://…supabase.co/storage/v1/object/sign/…",
+    "expires_in_seconds": 900
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -130,22 +172,48 @@ Sets journal_entry_id (and optionally journal_entry_line_id) on an existing docu
 |---|---|---|---|---|
 | `companyId` | path | `string` | yes |  |
 | `id` | path | `string` | yes |  |
+| `dry_run` | query | `string` | no | true (any case) previews the write without committing it, like the X-Dry-Run: true header. Any other value commits. |
 
 Request body:
 ```ts
 { journal_entry_id: string, journal_entry_line_id?: string, inbox_item_id?: string }
 ```
 
+Example request:
+```json
+{
+  "journal_entry_id": "a8f1…"
+}
+```
+
 Response `200`:
 ```ts
 {
-  data: { id: string, journal_entry_id: string, journal_entry_line_id: string, file_name: string },
+  data: { id: string, journal_entry_id: string, journal_entry_line_id: string | null, file_name: string },
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "0e9c…",
+    "journal_entry_id": "a8f1…",
+    "journal_entry_line_id": null,
+    "file_name": "kvitto-2026-05-12.pdf"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```
@@ -177,6 +245,13 @@ Request body:
 { journal_entry_id: string }
 ```
 
+Example request:
+```json
+{
+  "journal_entry_id": "dcccb3c5-b44a-4536-82fa-f0b9bb77f900"
+}
+```
+
 Response `200`:
 ```ts
 {
@@ -184,9 +259,25 @@ Response `200`:
   meta: {
     request_id: string,
     api_version: string,
-    next_cursor?: string,
+    next_cursor?: string | null,
     audit?: { voucher_number?: string, voucher_url?: string, audit_trail_url?: string, immutable_at?: string },
-    partial_expansions?: string[]
+    warnings?: { code: string, message_sv: string, message_en: string, remediation?: { description: string, tool?: string, args?: Record<string, unknown>, resource?: string } }[],
+    partial_expansions?: string[],
+    coverage?: Record<string, unknown>
+  }
+}
+```
+
+Example response `200`:
+```json
+{
+  "data": {
+    "id": "4d2fcdbb-13b3-4ff3-911f-a4cc82f1f6db",
+    "created_journal_entry_id": "dcccb3c5-b44a-4536-82fa-f0b9bb77f900"
+  },
+  "meta": {
+    "request_id": "req_…",
+    "api_version": "2026-05-12"
   }
 }
 ```

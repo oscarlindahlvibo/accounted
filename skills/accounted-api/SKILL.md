@@ -8,7 +8,7 @@ description: >-
   transactions and reconciliation, payroll (lön), VAT/moms and financial
   reports, SIE import/export, documents, webhooks. Covers auth with
   gnubok_sk_ API keys, conventions (dry-run, idempotency, cursor
-  pagination, scopes), and all 138 endpoints.
+  pagination, scopes), and all 173 endpoints.
 ---
 
 <!-- GENERATED FILE, do not edit. Source: lib/api/v1 registry + scripts/api-skill/overlays. Regenerate with `npm run apiskill:generate`. -->
@@ -142,7 +142,7 @@ call can undo it, e.g. invoice credit).
 
 ## Endpoint index
 
-API version `2026-05-12`, 138 operations. Paths are shown without
+API version `2026-05-12`, 173 operations. Paths are shown without
 their `/api/v1` prefix (full base URL: `https://app.gnubok.se/api/v1`).
 
 ### Core (5)
@@ -157,7 +157,7 @@ GET /health : Health check [risk:low idempotent]
 GET /operations/{id} : Poll a long-running operation by id [scope:operations:read risk:low idempotent]
 ```
 
-### Journal entries (8)
+### Journal entries (9)
 
 Full detail: [references/journal-entries.md](references/journal-entries.md)
 
@@ -165,6 +165,7 @@ Full detail: [references/journal-entries.md](references/journal-entries.md)
 GET /companies/{companyId}/journal-entries : List journal entries (verifikationer) [scope:reports:read risk:low idempotent]
 POST /companies/{companyId}/journal-entries : Create a draft journal entry (verifikation) [scope:bookkeeping:write risk:high idempotent dry-run reversible]
 GET /companies/{companyId}/journal-entries/{id} : Retrieve a single verifikation by id [scope:reports:read risk:low idempotent]
+DELETE /companies/{companyId}/journal-entries/{id} : Cancel an uncommitted draft verifikation [scope:bookkeeping:write risk:low idempotent dry-run]
 POST /companies/{companyId}/journal-entries/{id}/commit : Commit a draft journal entry [scope:bookkeeping:write risk:high idempotent dry-run reversible]
 POST /companies/{companyId}/journal-entries/{id}/correct : Correct a posted journal entry (BFL 5:5 storno-then-replace) [scope:bookkeeping:write risk:high idempotent dry-run]
 POST /companies/{companyId}/journal-entries/{id}/reverse : Storno a posted journal entry [scope:bookkeeping:write risk:high idempotent dry-run]
@@ -192,7 +193,7 @@ POST /companies/{companyId}/fiscal-periods/{id}/year-end : Execute year-end clos
 GET /companies/{companyId}/skatteverket/vat-declarations : Read a filed momsdeklaration (submitted and/or decided) from Skatteverket [scope:compliance:read risk:low idempotent]
 ```
 
-### Invoices (AR) (10)
+### Invoices (AR) (12)
 
 Full detail: [references/invoices.md](references/invoices.md)
 
@@ -201,10 +202,12 @@ GET /companies/{companyId}/invoices : List invoices for a company [scope:invoice
 POST /companies/{companyId}/invoices : Create a draft invoice, proforma, or delivery note [scope:invoices:write risk:medium idempotent dry-run reversible]
 GET /companies/{companyId}/invoices/{id} : Retrieve a single invoice by id [scope:invoices:read risk:low idempotent]
 PATCH /companies/{companyId}/invoices/{id} : Update a draft invoice (metadata fields, optionally replacing line items) [scope:invoices:write risk:low idempotent dry-run reversible]
+DELETE /companies/{companyId}/invoices/{id} : Delete a draft invoice (hard delete if unnumbered, makulering if numbered) [scope:invoices:write risk:high dry-run]
 POST /companies/{companyId}/invoices/{id}/credit : Issue a credit note (kreditfaktura) against an invoice [scope:invoices:write risk:high idempotent dry-run]
 POST /companies/{companyId}/invoices/{id}/mark-paid : Record a payment against an invoice [scope:invoices:write risk:medium idempotent dry-run]
 POST /companies/{companyId}/invoices/{id}/mark-sent : Transition a draft invoice to sent (without emailing) [scope:invoices:write risk:medium idempotent dry-run]
 GET /companies/{companyId}/invoices/{id}/pdf : Download the rendered invoice PDF [scope:invoices:read risk:low idempotent]
+POST /companies/{companyId}/invoices/{id}/quote-status : Record the customer decision on a quote (offert) [scope:invoices:write risk:low idempotent dry-run reversible]
 POST /companies/{companyId}/invoices/{id}/send : Send a draft invoice to the customer by email [scope:invoices:write risk:high idempotent dry-run]
 POST /companies/{companyId}/invoices/bulk-create : Create up to 50 draft invoices in one call (partial-success) [scope:invoices:write risk:medium idempotent dry-run reversible]
 ```
@@ -254,13 +257,17 @@ POST /companies/{companyId}/documents/{id}/link : Link a document to a journal e
 POST /companies/{companyId}/inbox-items/{id}/stamp : Mark an inbox item as consumed by a journal entry [scope:documents:write risk:low idempotent]
 ```
 
-### Banking (22)
+### Banking (28)
 
 Full detail: [references/banking.md](references/banking.md)
 
 ```text
+GET /companies/{companyId}/bank-connections : List PSD2 bank connections with sync freshness and consent expiry [scope:companies:read risk:low idempotent]
+POST /companies/{companyId}/bank-connections/{connectionId}/sync : Sync one bank connection now instead of waiting for the nightly run [scope:transactions:write risk:low]
+GET /companies/{companyId}/cash-accounts : List bank/cash accounts with the bank-reported balance [scope:transactions:read risk:low idempotent]
 POST /companies/{companyId}/imports/bank : Import a bank-file (CSV / XML / CAMT053) [scope:transactions:write risk:medium idempotent]
-POST /companies/{companyId}/imports/sie : Import a SIE4 file [scope:bookkeeping:write risk:high idempotent]
+POST /companies/{companyId}/imports/sie : Import a SIE4 file [scope:bookkeeping:write risk:high idempotent reversible]
+POST /companies/{companyId}/imports/sie/upload : Reserve a direct SIE upload [scope:bookkeeping:write risk:low reversible]
 GET /companies/{companyId}/reconciliation/accounts : List the accounts that can be reconciled, with status per account [scope:reconciliation:read risk:low idempotent]
 GET /companies/{companyId}/reconciliation/accounts/{accountKey} : The reconciliation bridge for one account [scope:reconciliation:read risk:low idempotent]
 GET /companies/{companyId}/reconciliation/accounts/{accountKey}/items : List the rows behind one account's bridge, bucketed [scope:reconciliation:read risk:low idempotent]
@@ -276,6 +283,8 @@ GET /companies/{companyId}/reconciliation/bank/status : Bank-reconciliation heal
 GET /companies/{companyId}/transactions : List transactions for a company [scope:transactions:read risk:low idempotent]
 GET /companies/{companyId}/transactions/{id} : Retrieve a single transaction by id [scope:transactions:read risk:low idempotent]
 POST /companies/{companyId}/transactions/{id}/categorize : Categorize a transaction and create the journal entry [scope:transactions:write risk:medium idempotent dry-run reversible]
+POST /companies/{companyId}/transactions/{id}/ignore : Ignore a bank transaction (no verifikat, allowed in locked periods) [scope:transactions:write risk:low idempotent dry-run reversible]
+DELETE /companies/{companyId}/transactions/{id}/ignore : Restore an ignored bank transaction to the "to book" list [scope:transactions:write risk:low idempotent dry-run reversible]
 POST /companies/{companyId}/transactions/{id}/match-invoice : Match a positive bank transaction to a customer invoice [scope:transactions:write risk:high idempotent]
 POST /companies/{companyId}/transactions/{id}/match-supplier-invoice : Match a negative bank transaction to a supplier invoice [scope:transactions:write risk:high idempotent]
 POST /companies/{companyId}/transactions/{id}/uncategorize : Reverse the categorization of a transaction (storno + reset) [scope:transactions:write risk:medium idempotent dry-run]
@@ -283,7 +292,7 @@ POST /companies/{companyId}/transactions/batch-categorize : Categorize up to 100
 POST /companies/{companyId}/transactions/ingest : Bulk-ingest transactions (up to 500 per call) [scope:transactions:write risk:medium idempotent dry-run]
 ```
 
-### Employees (13)
+### Employees (26)
 
 Full detail: [references/employees.md](references/employees.md)
 
@@ -296,14 +305,27 @@ DELETE /companies/{companyId}/employees/{id} : Soft-delete an employee [scope:pa
 GET /companies/{companyId}/employees/{id}/absence : List absence days for an employee in a date range [scope:payroll:read risk:low idempotent]
 PUT /companies/{companyId}/employees/{id}/absence : Register absence for an employee over a date range [scope:payroll:write risk:low idempotent dry-run reversible]
 DELETE /companies/{companyId}/employees/{id}/absence : Delete absence days for an employee in a date range [scope:payroll:write risk:low idempotent dry-run]
+GET /companies/{companyId}/employees/{id}/benefits : List the benefits (förmåner) registered on an employee [scope:payroll:read risk:low idempotent]
+POST /companies/{companyId}/employees/{id}/benefits : Register a benefit (förmån) on an employee [scope:payroll:write risk:low idempotent dry-run reversible]
+PATCH /companies/{companyId}/employees/{id}/benefits/{benefitId} : Partially update a benefit (förmån) on an employee [scope:payroll:write risk:low idempotent dry-run reversible]
+DELETE /companies/{companyId}/employees/{id}/benefits/{benefitId} : Remove a benefit (förmån) from an employee [scope:payroll:write risk:medium idempotent dry-run]
 GET /companies/{companyId}/employees/{id}/opening-balances : Get an employee's payroll cutover opening balances [scope:payroll:read risk:low idempotent]
 PUT /companies/{companyId}/employees/{id}/opening-balances : Set an employee's payroll cutover opening balances [scope:payroll:write risk:medium idempotent dry-run reversible]
+GET /companies/{companyId}/employees/{id}/recurring-lines : List recurring payslip lines for an employee [scope:payroll:read risk:low idempotent]
+POST /companies/{companyId}/employees/{id}/recurring-lines : Create a recurring payslip line for an employee [scope:payroll:write risk:low idempotent dry-run reversible]
+PATCH /companies/{companyId}/employees/{id}/recurring-lines/{lineId} : Update a recurring payslip line [scope:payroll:write risk:low idempotent dry-run reversible]
+DELETE /companies/{companyId}/employees/{id}/recurring-lines/{lineId} : Delete a recurring payslip line, or deactivate it if a run already used it [scope:payroll:write risk:low idempotent dry-run]
 GET /companies/{companyId}/employees/{id}/vacation-balance : Get an employee's current vacation balance [scope:payroll:read risk:low idempotent]
+GET /companies/{companyId}/employees/{id}/worked-days : List worked days (hours per date) for an employee in a date range [scope:payroll:read risk:low idempotent]
+PUT /companies/{companyId}/employees/{id}/worked-days : Register worked hours per day for an employee (bulk upsert) [scope:payroll:write risk:low idempotent dry-run reversible]
+DELETE /companies/{companyId}/employees/{id}/worked-days : Delete worked days for an employee in a date range [scope:payroll:write risk:low idempotent dry-run]
 PUT /companies/{companyId}/employees/opening-balances : Bulk-set payroll cutover opening balances (atomic) [scope:payroll:write risk:medium idempotent dry-run reversible]
+GET /companies/{companyId}/salary/settings : Get the company payroll settings [scope:payroll:read risk:low idempotent]
+PATCH /companies/{companyId}/salary/settings : Partially update the company payroll settings [scope:payroll:write risk:low idempotent dry-run reversible]
 POST /companies/{companyId}/salary/vacation-year-close : Close a vacation year (semesterberedning + arsavslut) [scope:payroll:write risk:high idempotent dry-run]
 ```
 
-### Salary runs (18)
+### Salary runs (22)
 
 Full detail: [references/salary-runs.md](references/salary-runs.md)
 
@@ -316,19 +338,23 @@ DELETE /companies/{companyId}/salary-runs/{id} : Delete a draft salary run [scop
 POST /companies/{companyId}/salary-runs/{id}/approve : Approve a reviewed salary run [scope:payroll:write risk:low idempotent dry-run]
 POST /companies/{companyId}/salary-runs/{id}/book : Post the verifikationer for a paid salary run [scope:payroll:write risk:high idempotent dry-run]
 POST /companies/{companyId}/salary-runs/{id}/calculate : Calculate a draft salary run and advance it to review [scope:payroll:write risk:medium idempotent dry-run]
+POST /companies/{companyId}/salary-runs/{id}/correct : Correct a booked salary run (rättelsekörning): storno its verifikat and open a new draft for the same period [scope:payroll:write risk:high idempotent dry-run]
 GET /companies/{companyId}/salary-runs/{id}/employees : List per-employee results of a salary run [scope:payroll:read risk:low idempotent]
 POST /companies/{companyId}/salary-runs/{id}/employees : Add an employee to a draft salary run [scope:payroll:write risk:low idempotent dry-run reversible]
 GET /companies/{companyId}/salary-runs/{id}/employees/{employeeId} : Get one employee's payslip in a salary run [scope:payroll:read risk:low idempotent]
+PATCH /companies/{companyId}/salary-runs/{id}/employees/{employeeId} : Set this run's base salary for one employee [scope:payroll:write risk:medium idempotent dry-run reversible]
 DELETE /companies/{companyId}/salary-runs/{id}/employees/{employeeId} : Remove an employee from a draft salary run [scope:payroll:write risk:low idempotent dry-run reversible]
 POST /companies/{companyId}/salary-runs/{id}/employees/{employeeId}/lines : Add a payslip line to an employee in a draft salary run [scope:payroll:write risk:low idempotent dry-run reversible]
 POST /companies/{companyId}/salary-runs/{id}/generate-agi : Generate the Skatteverket AGI XML for a salary run [scope:payroll:write risk:medium idempotent]
 PATCH /companies/{companyId}/salary-runs/{id}/lines/{lineId} : Update a payslip line in a draft salary run [scope:payroll:write risk:low idempotent dry-run reversible]
 DELETE /companies/{companyId}/salary-runs/{id}/lines/{lineId} : Delete a payslip line from a draft salary run [scope:payroll:write risk:low idempotent dry-run]
 POST /companies/{companyId}/salary-runs/{id}/mark-paid : Mark an approved salary run as paid [scope:payroll:write risk:low idempotent dry-run]
+POST /companies/{companyId}/salary-runs/{id}/payment-file : Generate the bank payment file (pain.001 or Bankgirot LB) for a salary run [scope:payroll:write risk:medium idempotent dry-run reversible]
+GET /companies/{companyId}/salary-runs/{id}/payment-files : List the archived bank payment files of a salary run [scope:payroll:read risk:low idempotent]
 GET /companies/{companyId}/salary-runs/{id}/payslips/{employeeId}/pdf : Download one employee's payslip as PDF [scope:payroll:read risk:low idempotent]
 ```
 
-### Reports (16)
+### Reports (19)
 
 Full detail: [references/reports.md](references/reports.md)
 
@@ -349,6 +375,22 @@ GET /companies/{companyId}/reports/supplier-ledger : Supplier ledger: unpaid sup
 GET /companies/{companyId}/reports/trial-balance : Trial balance (huvudboksrapport) for a fiscal period [scope:reports:read risk:low idempotent]
 GET /companies/{companyId}/reports/vacation-liability : Vacation liability (semesterlöneskuld) per employee at year-end [scope:payroll:read risk:low idempotent]
 GET /companies/{companyId}/reports/vat-declaration : Swedish VAT declaration (momsdeklaration) for a period [scope:reports:read risk:low idempotent]
+GET /companies/{companyId}/reports/vat-declaration/filings : List the calendar VAT periods the company has recorded as filed [scope:reports:read risk:low idempotent]
+POST /companies/{companyId}/reports/vat-declaration/filings : Record that a VAT period was filed outside the Skatteverket connection [scope:bookkeeping:write risk:low idempotent dry-run reversible]
+DELETE /companies/{companyId}/reports/vat-declaration/filings : Undo a manual "filed" mark on a VAT period [scope:bookkeeping:write risk:low idempotent dry-run reversible]
+```
+
+### Fixed assets (6)
+
+Full detail: [references/assets.md](references/assets.md)
+
+```text
+GET /companies/{companyId}/assets : List the fixed-asset register (anläggningsregister) [scope:reports:read risk:low idempotent]
+POST /companies/{companyId}/assets : Register a fixed asset (no voucher is posted) [scope:bookkeeping:write risk:low idempotent dry-run]
+GET /companies/{companyId}/assets/{id} : Get one fixed asset [scope:reports:read risk:low idempotent]
+PATCH /companies/{companyId}/assets/{id} : Partially update a fixed asset [scope:bookkeeping:write risk:low idempotent dry-run reversible]
+DELETE /companies/{companyId}/assets/{id} : Delete an asset that never reached the books [scope:bookkeeping:write risk:medium dry-run]
+POST /companies/{companyId}/assets/{id}/dispose : Dispose a fixed asset and post the avyttring voucher [scope:bookkeeping:write risk:medium idempotent dry-run reversible]
 ```
 
 ### Webhooks (9)

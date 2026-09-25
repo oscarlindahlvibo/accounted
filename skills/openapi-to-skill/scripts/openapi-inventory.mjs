@@ -73,6 +73,15 @@ function deref(spec, schema, seen) {
 
 const MAX_DEPTH = 6
 
+function isContainer(schema) {
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type]
+  return (
+    types.includes('object') ||
+    types.includes('array') ||
+    Boolean(schema.properties || schema.items || schema.oneOf || schema.anyOf || schema.allOf)
+  )
+}
+
 export function condenseSchema(spec, schema, { depth = 0, seen = new Set() } = {}) {
   if (schema === undefined || schema === null) return 'unknown'
   if (schema === true) return 'unknown'
@@ -81,7 +90,9 @@ export function condenseSchema(spec, schema, { depth = 0, seen = new Set() } = {
   schema = deref(spec, schema, seen)
   if (schema.__cycle) return refName(schema.__cycle)
   if (schema.__unresolved) return refName(schema.__unresolved)
-  if (depth > MAX_DEPTH) return '{...}'
+  // The depth cap exists to stop nested objects from flooding a line; a
+  // scalar leaf is as short as `{...}`, so it keeps its real type.
+  if (depth > MAX_DEPTH && isContainer(schema)) return '{...}'
 
   if (Array.isArray(schema.enum)) {
     return schema.enum.map((v) => JSON.stringify(v)).join(' | ')
@@ -113,8 +124,11 @@ export function condenseSchema(spec, schema, { depth = 0, seen = new Set() } = {
 
   let type = schema.type
   if (Array.isArray(type)) {
+    // OpenAPI 3.1 nullability is `type: [T, "null"]`. The null member must
+    // not inherit the object's properties, or it renders as the object again
+    // and the `| null` disappears after dedup.
     const parts = type.map((t) =>
-      condenseSchema(spec, { ...schema, type: t }, { depth, seen }),
+      t === 'null' ? 'null' : condenseSchema(spec, { ...schema, type: t }, { depth, seen }),
     )
     return [...new Set(parts)].join(' | ')
   }
@@ -296,6 +310,26 @@ function successResponse(op) {
 }
 
 /**
+ * A media-type `example` rendered as a fenced JSON block.
+ *
+ * A condensed schema tells an agent the shape of a field; a worked example
+ * tells it the conventions the shape cannot express (id formats, which
+ * optional fields normally travel together, plausible values). Both are
+ * cheap to read and only one of them is derivable from types.
+ */
+function renderExample(label, value) {
+  if (value === undefined || value === null) return []
+  let json
+  try {
+    json = JSON.stringify(value, null, 2)
+  } catch {
+    return []
+  }
+  if (!json) return []
+  return [`${label}:`, '```json', json, '```', '']
+}
+
+/**
  * Full Markdown block for one operation: what a reference file is built from.
  */
 export function renderOperationMd(spec, entry) {
@@ -328,7 +362,8 @@ export function renderOperationMd(spec, entry) {
     lines.push('')
   }
 
-  const body = op.requestBody?.content?.['application/json']?.schema
+  const jsonBody = op.requestBody?.content?.['application/json']
+  const body = jsonBody?.schema
   const multipart = op.requestBody?.content?.['multipart/form-data']?.schema
   if (body) {
     lines.push('Request body:')
@@ -336,6 +371,7 @@ export function renderOperationMd(spec, entry) {
     lines.push(condenseSchema(spec, body))
     lines.push('```')
     lines.push('')
+    lines.push(...renderExample('Example request', jsonBody.example))
   } else if (multipart) {
     lines.push('Request body (`multipart/form-data`):')
     lines.push('```ts')
@@ -345,13 +381,15 @@ export function renderOperationMd(spec, entry) {
   }
 
   const [code, response] = successResponse(op)
-  const responseSchema = response?.content?.['application/json']?.schema
+  const jsonResponse = response?.content?.['application/json']
+  const responseSchema = jsonResponse?.schema
   if (responseSchema) {
     lines.push(`Response \`${code}\`:`)
     lines.push('```ts')
     lines.push(condenseSchema(spec, responseSchema))
     lines.push('```')
     lines.push('')
+    lines.push(...renderExample(`Example response \`${code}\``, jsonResponse.example))
   } else if (response) {
     const contentTypes = Object.keys(response.content ?? {})
     lines.push(
