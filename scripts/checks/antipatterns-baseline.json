@@ -41,7 +41,7 @@
     "files": []
   },
   "providerHosts": {
-    "count": 21,
+    "count": 22,
     "files": [
       "app/api/connect/bank/[...path]/route.ts",
       "extensions/general/bolagsverket/lib/client.ts",
@@ -55,6 +55,7 @@
       "extensions/general/tic/lib/bankid-client.ts",
       "extensions/general/tic/lib/bankid-types.ts",
       "extensions/general/whatsapp-inbox/lib/graph-api.ts",
+      "lib/bolagsverket/env.ts",
       "lib/connect/upstreams/enable-banking-jwt.ts",
       "lib/invoices/transports/qvalia.ts",
       "lib/providers/bjornlunden/config.ts",

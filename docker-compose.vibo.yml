@@ -8,5 +8,6 @@ services:
     image: !reset null
     build:
       context: .
+      dockerfile: docker/Dockerfile
       args:
         EXTENSIONS_PRESET: vibo
