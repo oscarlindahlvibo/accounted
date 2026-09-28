@@ -66,6 +66,97 @@ const SINGLE_SUBPAYMENT = `<?xml version="1.0" encoding="UTF-8" standalone="yes"
 </BkToCstmrDbtCdtNtfctn>
 </Document>`
 
+// A real incoming-payments (CRDT) "Redovisning" export, trimmed to two Ntry
+// entries. Revealed two production shapes the leverantörsbetalning samples
+// above never exercise: (1) RfrdDocInf/Nb is often EMPTY for these hyresavi
+// payers, with the actual reference living in the free-text AddtlRmtInf
+// instead; (2) one TxDtls can carry SEVERAL <Strd> blocks — a single tenant
+// transfer settling two references at once (3745 + 6077 = 9822), each with
+// its own RfrdDocAmt.
+const CRDT_MULTI_STRD = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.054.001.02">
+<BkToCstmrDbtCdtNtfctn>
+<GrpHdr><MsgId>SWEDSESSCRED202609250043873380</MsgId><CreDtTm>2026-09-25T19:37:46.855934</CreDtTm><AddtlInf>CRED</AddtlInf></GrpHdr>
+<Ntfctn>
+<Id>SWEDSESSCRED20260925004387338000001</Id>
+<Acct><Id><Othr><Id>840533338800950</Id></Othr></Id><Ccy>SEK</Ccy></Acct>
+<Ntry>
+<Amt Ccy="SEK">3000.00</Amt>
+<CdtDbtInd>CRDT</CdtDbtInd>
+<Sts>BOOK</Sts>
+<BookgDt><Dt>2026-09-25</Dt></BookgDt>
+<AcctSvcrRef>2026092588651314</AcctSvcrRef>
+<NtryDtls>
+<TxDtls>
+<Refs><AcctSvcrRef>202609258865131400000001</AcctSvcrRef></Refs>
+<AmtDtls><TxAmt><Amt Ccy="SEK">3000.00</Amt></TxAmt></AmtDtls>
+<RltdPties><Dbtr><Nm>Qasa AB</Nm></Dbtr></RltdPties>
+<RmtInf><Strd><RfrdDocInf><Tp><CdOrPrtry><Cd>CINV</Cd></CdOrPrtry></Tp><Nb>415924146786850</Nb></RfrdDocInf><RfrdDocAmt><RmtdAmt Ccy="SEK">3000.00</RmtdAmt></RfrdDocAmt></Strd></RmtInf>
+</TxDtls>
+</NtryDtls>
+</Ntry>
+<Ntry>
+<Amt Ccy="SEK">36461.00</Amt>
+<CdtDbtInd>CRDT</CdtDbtInd>
+<Sts>BOOK</Sts>
+<BookgDt><Dt>2026-09-25</Dt></BookgDt>
+<AcctSvcrRef>2026092588681113</AcctSvcrRef>
+<NtryDtls>
+<TxDtls>
+<Refs><AcctSvcrRef>202609258868111300000001</AcctSvcrRef></Refs>
+<AmtDtls><TxAmt><Amt Ccy="SEK">9822.00</Amt></TxAmt></AmtDtls>
+<RltdPties><Dbtr><Nm>AMANDA HELLING GRAHOVIC</Nm></Dbtr></RltdPties>
+<RmtInf>
+<Strd><RfrdDocInf><Tp><CdOrPrtry><Cd>CINV</Cd></CdOrPrtry></Tp></RfrdDocInf><RfrdDocAmt><RmtdAmt Ccy="SEK">3745.00</RmtdAmt></RfrdDocAmt><AddtlRmtInf>Delbet</AddtlRmtInf></Strd>
+<Strd><RfrdDocInf><Tp><CdOrPrtry><Cd>CINV</Cd></CdOrPrtry></Tp></RfrdDocInf><RfrdDocAmt><RmtdAmt Ccy="SEK">6077.00</RmtdAmt></RfrdDocAmt><AddtlRmtInf>396069</AddtlRmtInf></Strd>
+</RmtInf>
+</TxDtls>
+</NtryDtls>
+<NtryDtls>
+<TxDtls>
+<Refs><AcctSvcrRef>202609258868111300000004</AcctSvcrRef></Refs>
+<AmtDtls><TxAmt><Amt Ccy="SEK">5951.00</Amt></TxAmt></AmtDtls>
+<RltdPties><Dbtr><Nm>JENNIFER PETERSEN</Nm></Dbtr></RltdPties>
+<RmtInf><Strd><RfrdDocInf><Tp><CdOrPrtry><Cd>CINV</Cd></CdOrPrtry></Tp></RfrdDocInf><RfrdDocAmt><RmtdAmt Ccy="SEK">5951.00</RmtdAmt></RfrdDocAmt><AddtlRmtInf>394460</AddtlRmtInf></Strd></RmtInf>
+</TxDtls>
+</NtryDtls>
+</Ntry>
+</Ntfctn>
+</BkToCstmrDbtCdtNtfctn>
+</Document>`
+
+describe('parseCamt054: real incoming-payments (CRDT) shapes', () => {
+  it('falls back to AddtlRmtInf when RfrdDocInf/Nb is empty', () => {
+    const result = parseCamt054(CRDT_MULTI_STRD)
+    const [, secondEntry] = result.entries
+    expect(secondEntry.direction).toBe('CRDT')
+    // Second Ntry's first TxDtls splits into two sub-payments (see below);
+    // its third NtryDtls sub-payment (JENNIFER PETERSEN) has an empty Nb.
+    const jennifer = secondEntry.subPayments.find((sp) => sp.counterpartyName === 'JENNIFER PETERSEN')
+    expect(jennifer).toMatchObject({ amount: 5951, reference: '394460' })
+  })
+
+  it('splits one TxDtls into several sub-payments when it carries multiple <Strd> blocks', () => {
+    const result = parseCamt054(CRDT_MULTI_STRD)
+    const [, secondEntry] = result.entries
+    const amanda = secondEntry.subPayments.filter((sp) => sp.counterpartyName === 'AMANDA HELLING GRAHOVIC')
+    expect(amanda).toHaveLength(2)
+    expect(amanda[0]).toMatchObject({ amount: 3745, reference: 'Delbet' })
+    expect(amanda[1]).toMatchObject({ amount: 6077, reference: '396069' })
+    expect(amanda[0].amount + amanda[1].amount).toBe(9822)
+  })
+
+  it('parses the CRDT direction and the first Ntry (a clean single reference) correctly', () => {
+    const result = parseCamt054(CRDT_MULTI_STRD)
+    expect(result.entries).toHaveLength(2)
+    const [firstEntry] = result.entries
+    expect(firstEntry).toMatchObject({ direction: 'CRDT', amount: 3000, bookingDate: '2026-09-25' })
+    expect(firstEntry.subPayments).toEqual([
+      { amount: 3000, counterpartyName: 'Qasa AB', reference: '415924146786850', subAcctSvcrRef: '202609258865131400000001' },
+    ])
+  })
+})
+
 describe('detectCamt054', () => {
   it('recognizes a camt.054 file by namespace and .xml extension', () => {
     expect(detectCamt054(TWO_SUBPAYMENT_LUMP, 'Atterredovisning.xml')).toBe(true)

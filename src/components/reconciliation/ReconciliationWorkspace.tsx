@@ -12,6 +12,7 @@ import { HelpPopover } from '@/components/ui/help-popover'
 import { EmptyState } from '@/components/ui/empty-state'
 import { AttnLine } from '@/components/ui/attn-line'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Button } from '@/components/ui/button'
 import { FyPicker } from '@/components/common/FyPicker'
 import { ReportDateRange, type DateRangeValue } from '@/components/common/ReportDateRange'
 import type { ReconciliationAccount } from '@/lib/reconciliation/schemas'
@@ -19,6 +20,7 @@ import type { FiscalPeriod } from '@/types'
 import { ReconciliationTable } from './ReconciliationTable'
 import { AccountOverview, type ReconciliationWindow } from './AccountOverview'
 import { ManualMatchMode } from './ManualMatchMode'
+import { BankgiroNotificationDialog } from './BankgiroNotificationDialog'
 
 /**
  * /reconciliation: one page for every account with an outside truth
@@ -53,6 +55,7 @@ export function ReconciliationWorkspace({ initialPeriods, initialCompanyId }: Re
   const [periodId, setPeriodId] = useState<string | null>(null)
   const [periodBounds, setPeriodBounds] = useState<{ start: string; end: string } | null>(null)
   const [dateRange, setDateRange] = useState<DateRangeValue>({})
+  const [bankgiroDialogOpen, setBankgiroDialogOpen] = useState(false)
 
   // The effective window: the range within the period, defaulting to the
   // period bounds. Null until the period picker has resolved.
@@ -136,6 +139,11 @@ export function ReconciliationWorkspace({ initialPeriods, initialCompanyId }: Re
               {t('v2_close')}
             </button>
           )}
+          {!flowAccount && (
+            <Button type="button" variant="outline" size="sm" onClick={() => setBankgiroDialogOpen(true)}>
+              Bankgiro-avräkning
+            </Button>
+          )}
           {/* On a phone the bar holds one picker: the month is the one a
               person changes while reconciling; the year waits for a wider screen. */}
           <div className={cn(flowAccount && 'hidden sm:block')}>
@@ -168,11 +176,20 @@ export function ReconciliationWorkspace({ initialPeriods, initialCompanyId }: Re
     />
   )
 
+  const bankgiroDialog = (
+    <BankgiroNotificationDialog
+      open={bankgiroDialogOpen}
+      onOpenChange={setBankgiroDialogOpen}
+      onConfirmed={() => void load()}
+    />
+  )
+
   if (loadError) {
     return (
       <div className="space-y-6">
         {header}
         <AttnLine action={{ label: t('older_show'), onClick: () => void load() }}>{t('load_failed')}</AttnLine>
+        {bankgiroDialog}
       </div>
     )
   }
@@ -192,6 +209,7 @@ export function ReconciliationWorkspace({ initialPeriods, initialCompanyId }: Re
             </div>
           ))}
         </div>
+        {bankgiroDialog}
       </div>
     )
   }
@@ -209,6 +227,7 @@ export function ReconciliationWorkspace({ initialPeriods, initialCompanyId }: Re
           secondaryActionLabel={t('empty_connect_skv')}
           secondaryActionHref="/settings/skatteverket"
         />
+        {bankgiroDialog}
       </div>
     )
   }
@@ -243,6 +262,7 @@ export function ReconciliationWorkspace({ initialPeriods, initialCompanyId }: Re
       ) : (
         <ReconciliationTable accounts={accounts} onSelect={select} footer={railFooter} />
       )}
+      {bankgiroDialog}
     </div>
   )
 }

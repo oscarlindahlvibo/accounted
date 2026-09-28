@@ -93,37 +93,57 @@ function parseEntry(ntry: string): ParsedCamt054Entry | null {
   if (isNaN(amount)) return null
 
   const subPayments: ParsedCamt054SubPayment[] = []
-  // Each sub-payment lives in its own <NtryDtls><TxDtls>; a Ntry may carry
-  // several <NtryDtls> siblings (observed) or several <TxDtls> nested under
-  // one <NtryDtls> (spec-permitted) — walk both.
+  // Each Bankgiro payment lives in its own <NtryDtls><TxDtls>; a Ntry may
+  // carry several <NtryDtls> siblings (observed) or several <TxDtls> nested
+  // under one <NtryDtls> (spec-permitted) — walk both. Within ONE <TxDtls>,
+  // a payer can in turn settle several references in one transfer (a tenant
+  // paying two months' hyresavier together): each is its own <RmtInf><Strd>
+  // with its own RfrdDocAmt, so one TxDtls can explode into several
+  // sub-payments (see parseSubPayments).
   for (const ntryDtls of extractElements(ntry, 'NtryDtls')) {
     for (const txDtls of extractElements(ntryDtls, 'TxDtls')) {
-      subPayments.push(parseSubPayment(txDtls, direction))
+      subPayments.push(...parseSubPayments(txDtls, direction))
     }
   }
 
   return { direction, amount, bookingDate, acctSvcrRef, subPayments }
 }
 
-function parseSubPayment(txDtls: string, direction: 'DBIT' | 'CRDT'): ParsedCamt054SubPayment {
-  const amountStr = extractNestedText(txDtls, 'AmtDtls', 'Amt') ?? extractTextContent(txDtls, 'Amt')
-  const amount = amountStr ? Math.abs(Math.round(parseFloat(amountStr) * 100) / 100) : 0
-
-  // DBIT entry: money left our account, the sub-payment's counterparty is
-  // the creditor (Cdtr) it went to. CRDT entry: money arrived, the
-  // counterparty is the debtor (Dbtr) it came from.
+function parseSubPayments(txDtls: string, direction: 'DBIT' | 'CRDT'): ParsedCamt054SubPayment[] {
+  // DBIT entry: money left our account, the counterparty is the creditor
+  // (Cdtr) it went to. CRDT entry: money arrived, the counterparty is the
+  // debtor (Dbtr) it came from. Shared by every Strd within this TxDtls.
   const counterpartyRaw =
     direction === 'DBIT'
       ? extractNestedText(txDtls, 'Cdtr', 'Nm')
       : extractNestedText(txDtls, 'Dbtr', 'Nm')
   const counterpartyName = counterpartyRaw ? unescapeXml(counterpartyRaw) : null
-
-  // Only structured remittance carries a machine-comparable reference;
-  // unstructured free text (<Ustrd>) is not trustworthy enough to match on.
-  const reference = extractNestedText(txDtls, 'RfrdDocInf', 'Nb')
   const subAcctSvcrRef = extractNestedText(txDtls, 'Refs', 'AcctSvcrRef')
 
-  return { amount, counterpartyName, reference, subAcctSvcrRef }
+  const rmtInf = extractNestedElement(txDtls, 'RmtInf')
+  const strdBlocks = rmtInf ? extractElements(rmtInf, 'Strd') : []
+
+  if (strdBlocks.length === 0) {
+    // No structured remittance at all: one sub-payment for the whole
+    // TxDtls amount, with nothing to match a reference against.
+    const amountStr = extractNestedText(txDtls, 'AmtDtls', 'Amt') ?? extractTextContent(txDtls, 'Amt')
+    const amount = amountStr ? Math.abs(Math.round(parseFloat(amountStr) * 100) / 100) : 0
+    return [{ amount, counterpartyName, reference: null, subAcctSvcrRef }]
+  }
+
+  return strdBlocks.map((strd) => {
+    const amountStr = extractNestedText(strd, 'RfrdDocAmt', 'RmtdAmt')
+    const amount = amountStr ? Math.abs(Math.round(parseFloat(amountStr) * 100) / 100) : 0
+    // The structured reference (RfrdDocInf/Nb) is the primary, machine-issued
+    // reference when present. Several real Bankgiro payers (hyresavier from
+    // a property-management portal, observed) leave it empty and put the
+    // actual invoice/tenant reference in the free-text AddtlRmtInf instead;
+    // the matcher's own digit-length floor (ocr-keys.ts) rejects anything
+    // too short or non-numeric to be trustworthy, so falling back here adds
+    // recall without weakening the match.
+    const reference = extractNestedText(strd, 'RfrdDocInf', 'Nb') ?? extractTextContent(strd, 'AddtlRmtInf')
+    return { amount, counterpartyName, reference, subAcctSvcrRef }
+  })
 }
 
 // ---- shared hand-rolled XML helpers (same approach as camt053.ts) ----
@@ -150,12 +170,17 @@ function extractTextContent(xml: string, tagName: string): string | null {
 }
 
 function extractNestedText(xml: string, parentTag: string, childTag: string): string | null {
-  const parentRegex = new RegExp(`<${parentTag}[^>]*>([\\s\\S]*?)<\\/${parentTag}>`, 'i')
-  const parentMatch = xml.match(parentRegex)
-  if (!parentMatch) return null
+  const parent = extractNestedElement(xml, parentTag)
+  if (!parent) return null
   const childRegex = new RegExp(`<${childTag}[^>]*>([^<]+)<`, 'i')
-  const childMatch = parentMatch[1].match(childRegex)
+  const childMatch = parent.match(childRegex)
   return childMatch?.[1]?.trim() || null
+}
+
+/** Inner XML of the first occurrence of a tag (not just its flat text content). */
+function extractNestedElement(xml: string, tagName: string): string | null {
+  const regex = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)<\\/${tagName}>`, 'i')
+  return xml.match(regex)?.[1] ?? null
 }
 
 function unescapeXml(value: string): string {
