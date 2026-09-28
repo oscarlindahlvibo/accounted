@@ -28,6 +28,7 @@ import { bankLogoUrl } from '@/lib/reconciliation/bank-logos'
 import type { RowProposal } from '@/components/transactions/TransactionInboxCard'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import TransactionStatusBar from '@/components/transactions/TransactionStatusBar'
+import { BankgiroNotificationDialog } from '@/components/reconciliation/BankgiroNotificationDialog'
 import BankSyncStatusChip from '@/components/transactions/BankSyncStatusChip'
 import { ContextPicker, type ContextPickerItem } from '@/components/common/ContextPicker'
 import { FyPicker } from '@/components/common/FyPicker'
@@ -491,6 +492,7 @@ export default function TransactionsPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [mode, setMode] = useState<ViewMode>('inbox')
   const [isDialogOpen, setIsDialogOpen] = useState(false)
+  const [bankgiroDialogOpen, setBankgiroDialogOpen] = useState(false)
   const [isCreating, setIsCreating] = useState(false)
   const [templateSuggestions, setTemplateSuggestions] = useState<Record<string, SuggestedTemplate[]>>({})
   // The assistant's reads for the loaded rows, so the review opens with one
@@ -4259,7 +4261,11 @@ export default function TransactionsPage() {
   return (
     <div className="space-y-8">
       {/* Page header (concept scene 10): title + Importera split button */}
-      <TransactionStatusBar onOpenCreateDialog={() => setIsDialogOpen(true)} />
+      <TransactionStatusBar onOpenCreateDialog={() => setIsDialogOpen(true)}>
+        <Button type="button" variant="outline" size="sm" onClick={() => setBankgiroDialogOpen(true)}>
+          Bankgiro-avräkning
+        </Button>
+      </TransactionStatusBar>
 
 
       {skvNeedsReconnect && sourceFilter === 'skatteverket' ? (
@@ -4661,6 +4667,11 @@ export default function TransactionsPage() {
       </div>
 
       {/* Dialogs */}
+      <BankgiroNotificationDialog
+        open={bankgiroDialogOpen}
+        onOpenChange={setBankgiroDialogOpen}
+        onConfirmed={() => void refreshTransactions()}
+      />
       {showBatchSelector && (
         <BatchCategorySelector
           open
