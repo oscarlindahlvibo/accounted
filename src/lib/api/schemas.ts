@@ -3001,6 +3001,34 @@ export const BankLinkSchema = z
   })
 
 /**
+ * Commits one reviewed camt.054 (Bankgiro Återredovisning) lump entry: see
+ * POST /api/reconciliation/bankgiro-notification/confirm. `existing_journal_entry_id`
+ * is set when the matched invoice already has a settlement verifikat awaiting
+ * bank match; otherwise the route books one via the invoice's own mark-paid
+ * route before linking.
+ */
+export const BankgiroNotificationConfirmSchema = z.object({
+  transaction_id: uuid,
+  entry: z.object({
+    direction: z.enum(['DBIT', 'CRDT']),
+    amount: z.number().positive(),
+    booking_date: isoDate,
+    acct_svcr_ref: z.string().nullable(),
+  }),
+  allocations: z
+    .array(
+      z.object({
+        type: z.enum(['supplier_invoice', 'invoice']),
+        id: uuid,
+        amount: z.number().positive(),
+        existing_journal_entry_id: uuid.nullable(),
+      }),
+    )
+    .min(1)
+    .max(50),
+})
+
+/**
  * Re-tag a mis-typed bank-account opening balance (a manual/import voucher that
  * is really an ingående balans) as source_type='opening_balance' so bank
  * reconciliation excludes it from the period movement. Routed to the
