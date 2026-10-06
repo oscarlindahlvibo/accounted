@@ -246,6 +246,9 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
   const [showPaymentDialog, setShowPaymentDialog] = useState(false)
   const [showSendDialog, setShowSendDialog] = useState(false)
   const [sendDialogMode, setSendDialogMode] = useState<'email' | 'manual'>('email')
+  const [showCopyDialog, setShowCopyDialog] = useState(false)
+  const [copyEmail, setCopyEmail] = useState('')
+  const [isSendingCopy, setIsSendingCopy] = useState(false)
   // #2399: "Ladda ner PDF" on a document that is not issued yet. The render
   // carries the UTKAST stamp, so the page asks before the file exists and
   // offers the path to the real document.
@@ -729,6 +732,35 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
       return false
     } finally {
       setIsUpdating(false)
+    }
+  }
+
+  async function sendInvoiceCopy() {
+    if (!invoice) return
+    const sv = locale.startsWith('sv')
+    const target = copyEmail.trim()
+    setIsSendingCopy(true)
+    try {
+      const response = await fetch(`/api/invoices/${invoice.id}/resend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: target }),
+      })
+      const body = await response.json().catch(() => null) as { error?: string } | null
+      if (!response.ok) throw new Error(body?.error ?? (sv ? 'Kunde inte skicka kopian' : 'Could not send the copy'))
+      toast({
+        title: sv ? 'Kopia skickad' : 'Copy sent',
+        description: sv ? 'Fakturan skickades till ' + target : 'The invoice was sent to ' + target,
+      })
+      setShowCopyDialog(false)
+    } catch (error) {
+      toast({
+        title: sv ? 'Kopian kunde inte skickas' : 'Copy could not be sent',
+        description: error instanceof Error ? error.message : String(error),
+        variant: 'destructive',
+      })
+    } finally {
+      setIsSendingCopy(false)
     }
   }
 
@@ -1885,6 +1917,43 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
               </Button>
             )
           )}
+          {invoice.status !== 'draft' && invoice.status !== 'cancelled' && !isDeliveryNote && invoice.invoice_number && (
+            <Button size="sm" variant="outline"
+              onClick={() => { setCopyEmail(invoice.customer?.email ?? ''); setShowCopyDialog(true) }}
+              disabled={!canWrite}
+              title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+            >
+              {canWrite ? <Mail className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
+              {locale.startsWith('sv') ? 'Skicka kopia' : 'Send copy'}
+            </Button>
+          )}
+          <Dialog open={showCopyDialog} onOpenChange={setShowCopyDialog}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>{locale.startsWith('sv') ? 'Skicka kopia av fakturan' : 'Send a copy of the invoice'}</DialogTitle>
+                <DialogDescription>
+                  {locale.startsWith('sv')
+                    ? 'Fakturan mejlas igen med PDF. Status och bokföring påverkas inte.'
+                    : 'The invoice is emailed again with the PDF. Status and bookkeeping are not affected.'}
+                </DialogDescription>
+              </DialogHeader>
+              <input
+                type="email"
+                value={copyEmail}
+                onChange={(e) => setCopyEmail(e.target.value)}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                placeholder="namn@foretag.se"
+              />
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setShowCopyDialog(false)} disabled={isSendingCopy}>
+                  {locale.startsWith('sv') ? 'Avbryt' : 'Cancel'}
+                </Button>
+                <Button onClick={sendInvoiceCopy} disabled={isSendingCopy || !copyEmail.trim()} loading={isSendingCopy}>
+                  {locale.startsWith('sv') ? 'Skicka' : 'Send'}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
           {creditNoteNeedsRepair && (
             <Button size="sm"
               onClick={() => openSendDialog('manual')}
