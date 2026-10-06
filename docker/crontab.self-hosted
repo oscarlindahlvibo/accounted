@@ -69,3 +69,5 @@
 
 # self-hosted-only jobs, not in vercel.json: see EXTRA_JOBS in scripts/generate-crontabs.ts
 17 * * * *          curl -sf -H "Authorization: Bearer ${CRON_SECRET}" ${APP_URL}/api/connector/sync/cron
+*/5 * * * *         curl -sf -H "Authorization: Bearer ${CRON_SECRET}" ${APP_URL}/api/extensions/invoice-inbox/ingest/mail/cron
+*/5 * * * *         curl -sf -H "Authorization: Bearer ${CRON_SECRET}" ${APP_URL}/api/extensions/invoice-inbox/ingest/drive/cron
