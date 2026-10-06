@@ -1,7 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { ImapFlow } from 'imapflow'
 import { simpleParser } from 'mailparser'
-import { ingestFile, readJsonEnv, resolveOwnerId } from './shared'
+import { ingestFile, resolveOwnerId } from './shared'
 
 const BATCH = 15
 const DONE_BOX = 'Accounted-behandlade'
@@ -36,17 +36,18 @@ function addressesOf(parsed: Awaited<ReturnType<typeof simpleParser>>): string[]
 /**
  * Polls one Google mailbox (IMAP) for mail with invoice/underlag attachments
  * and puts them in the right company's Dokumentinkorg. Routing is by the
- * recipient address (plus-addressing works): INGEST_MAIL_ROUTES maps
- * "underlag+vibo@domain" -> company id.
+ * recipient address; the ingest_mail_routes table maps address -> company.
+ * A plus-tag (ga+lev@domain) falls back to the plain address.
  */
 export async function pollIngestMailbox(supabase: SupabaseClient): Promise<MailPollResult> {
   const user = process.env.INGEST_IMAP_USER
   const pass = process.env.INGEST_IMAP_PASS
-  const routes = readJsonEnv<Record<string, string>>('INGEST_MAIL_ROUTES')
   const result: MailPollResult = { configured: false, messages: 0, ingested: 0, skipped: 0, failed: 0 }
-  if (!user || !pass || !routes) return result
+  if (!user || !pass) return result
+  const { data: routeRows } = await supabase.from('ingest_mail_routes').select('address, company_id')
+  const routeMap = new Map((routeRows ?? []).map((r) => [String(r.address).toLowerCase(), String(r.company_id)]))
+  if (routeMap.size === 0) return result
   result.configured = true
-  const routeMap = new Map(Object.entries(routes).map(([a, c]) => [a.toLowerCase(), c]))
 
   const client = new ImapFlow({
     host: process.env.INGEST_IMAP_HOST || 'imap.gmail.com',
@@ -71,7 +72,7 @@ export async function pollIngestMailbox(supabase: SupabaseClient): Promise<MailP
         result.messages++
         const parsed = await simpleParser(source)
         const to = addressesOf(parsed)
-        const companyId = to.map((a) => routeMap.get(a)).find(Boolean)
+        const companyId = to.map((a) => routeMap.get(a) ?? routeMap.get(a.replace(/\+[^@]*@/, '@'))).find(Boolean)
         if (!companyId) { moves.push({ uid, box: UNROUTED_BOX }); result.skipped++; continue }
         if (!ownerCache.has(companyId)) ownerCache.set(companyId, await resolveOwnerId(supabase, companyId))
         const ownerId = ownerCache.get(companyId)

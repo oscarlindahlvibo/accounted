@@ -1,6 +1,6 @@
 import { createSign } from 'node:crypto'
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { ingestFile, readJsonEnv, resolveOwnerId } from './shared'
+import { ingestFile, resolveOwnerId } from './shared'
 
 const API = 'https://www.googleapis.com/drive/v3'
 const FOLDER_MIME = 'application/vnd.google-apps.folder'
@@ -86,23 +86,29 @@ async function download(token: string, f: DriveFile): Promise<{ buffer: Buffer; 
 }
 
 /**
- * Pulls new files from one Drive folder per company (INGEST_DRIVE_FOLDERS:
- * company id -> folder id) into the company's Dokumentinkorg and moves each
+ * Pulls new files from one Drive subfolder per company (created under
+ * INGEST_DRIVE_ROOT_FOLDER, named after the company) into the company's Dokumentinkorg and moves each
  * file to "Behandlade" (or "Fel" when it cannot be read). The folder must be
  * shared with the service account as editor.
  */
 export async function syncDriveFolders(supabase: SupabaseClient): Promise<DriveSyncResult> {
   const saRaw = process.env.INGEST_GOOGLE_SA_JSON_B64
-  const folders = readJsonEnv<Record<string, string>>('INGEST_DRIVE_FOLDERS')
+  const rootId = process.env.INGEST_DRIVE_ROOT_FOLDER
   const result: DriveSyncResult = { configured: false, files: 0, ingested: 0, failed: 0 }
-  if (!saRaw || !folders) return result
+  if (!saRaw || !rootId) return result
   result.configured = true
   const sa = JSON.parse(Buffer.from(saRaw, 'base64').toString('utf8')) as ServiceAccount
   const token = await accessToken(sa)
 
-  for (const [companyId, folderId] of Object.entries(folders)) {
+  // One subfolder per company under the root, named after the company; new
+  // companies get their folder on the next run.
+  const { data: companies } = await supabase.from('companies').select('id, name')
+  for (const company of companies ?? []) {
+    const companyId = String(company.id)
     const ownerId = await resolveOwnerId(supabase, companyId)
     if (!ownerId) continue
+    const folderName = String(company.name).replace(/['\\/]/g, '').trim() || companyId
+    const folderId = await ensureSubfolder(token, rootId, folderName)
     const list = await drive<{ files: DriveFile[] }>(
       token,
       '/files?q=' + q("'" + folderId + "' in parents and trashed=false and mimeType!='" + FOLDER_MIME + "'") +
