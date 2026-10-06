@@ -9,6 +9,10 @@ import {
 } from '@/lib/invoices/recurring-schedule-service'
 import { createQueuedMockSupabase, makeCustomer, makeCompanySettings } from '@/tests/helpers'
 import { eventBus } from '@/lib/events'
+import {
+  DimensionValidationError,
+  MandatoryDimensionMissingError,
+} from '@/lib/bookkeeping/dimension-errors'
 
 // ── Mocks for the executeRecurringSchedule auto-send path ─────────────
 // The pure date-helper tests below don't touch any of these modules.
@@ -31,12 +35,8 @@ vi.mock('@/lib/invoices/pdf-template', () => ({
 }))
 
 const mockPrepareRender = vi.fn()
-const mockSwishQr = vi.fn()
-const mockPaymentLinkQr = vi.fn()
 vi.mock('@/lib/invoices/pdf-render-helpers', () => ({
   prepareInvoicePdfRender: (...args: unknown[]) => mockPrepareRender(...args),
-  buildSwishQrDataUrl: (...args: unknown[]) => mockSwishQr(...args),
-  buildPaymentLinkQrDataUrl: (...args: unknown[]) => mockPaymentLinkQr(...args),
 }))
 
 const mockApplyPaymentLink = vi.fn()
@@ -320,7 +320,7 @@ describe('getStockholmDateHour', () => {
 })
 
 describe('executeRecurringSchedule auto-send', () => {
-  const { supabase, enqueue, reset } = createQueuedMockSupabase()
+  const { supabase, enqueue, reset, findCalls } = createQueuedMockSupabase()
   const client = supabase as unknown as SupabaseClient
   const today = new Date('2026-07-06T06:30:00Z')
 
@@ -394,15 +394,20 @@ describe('executeRecurringSchedule auto-send', () => {
     }
   }
 
-  /** Queue for the full happy path (see call order in the service). */
-  function enqueueHappyPath() {
+  /** Queue up to the send path's company_settings read (see call order in the service). */
+  function enqueueUntilSendPath(settings: typeof company = company) {
     enqueue({ data: customer, error: null }) // customers select
     enqueue({ data: { vat_registered: true }, error: null }) // company_settings VAT gate
     enqueue({ data: makeInsertedInvoice(), error: null }) // invoices insert
     enqueue({ data: null, error: null }) // invoice_items insert
     enqueue({ data: makeCompleteInvoice(), error: null }) // re-fetch with relations
-    enqueue({ data: company, error: null }) // company_settings (auto-send)
-    enqueue({ data: null, error: null }) // status flip to sent
+    enqueue({ data: settings, error: null }) // company_settings (auto-send)
+  }
+
+  /** Queue for the full happy path (see call order in the service). */
+  function enqueueHappyPath() {
+    enqueueUntilSendPath()
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // status flip draft -> sent (compare-and-set)
     enqueue({ data: null, error: null }) // journal_entry_id write-back
   }
 
@@ -421,8 +426,6 @@ describe('executeRecurringSchedule auto-send', () => {
       },
     )
     mockPrepareRender.mockResolvedValue({ branding: {}, company })
-    mockSwishQr.mockResolvedValue(null)
-    mockPaymentLinkQr.mockResolvedValue(null)
     mockRenderToBuffer.mockResolvedValue(Buffer.from('fake-pdf'))
     mockInvoicePDF.mockReturnValue('pdf-element')
     mockSendEmail.mockResolvedValue({ success: true, messageId: 'm-1' })
@@ -438,7 +441,6 @@ describe('executeRecurringSchedule auto-send', () => {
         return { failure: null }
       },
     )
-    mockPaymentLinkQr.mockResolvedValue('data:image/png;base64,QR')
 
     const result = await executeRecurringSchedule(client, makeSchedule(), today)
 
@@ -464,12 +466,17 @@ describe('executeRecurringSchedule auto-send', () => {
     expect(mockApplyPaymentLink.mock.invocationCallOrder[0]).toBeLessThan(
       mockRenderToBuffer.mock.invocationCallOrder[0],
     )
-    // QR built from the renderable copy (status overridden to 'sent').
-    expect(mockPaymentLinkQr).toHaveBeenCalledWith(
-      expect.objectContaining({ payment_link_url: 'https://pay.example/x', status: 'sent' }),
-    )
+    // The one QR resolved from the renderable copy (status overridden to
+    // 'sent'): the company's bankgiro has a wrong check digit and there is no
+    // Swish, so auto prints the link the send just created.
     expect(mockInvoicePDF).toHaveBeenCalledWith(
-      expect.objectContaining({ paymentLinkQrDataUrl: 'data:image/png;base64,QR' }),
+      expect.objectContaining({
+        invoice: expect.objectContaining({ payment_link_url: 'https://pay.example/x', status: 'sent' }),
+        paymentQr: expect.objectContaining({
+          kind: 'payment_link',
+          imageDataUrl: expect.stringMatching(/^data:image\/png;base64,/),
+        }),
+      }),
     )
     expect(mockSendEmail).toHaveBeenCalledWith(expect.objectContaining({
       attachments: [expect.objectContaining({
@@ -569,6 +576,120 @@ describe('executeRecurringSchedule auto-send', () => {
     expect(mockSendEmail).not.toHaveBeenCalled()
     expect(mockApplyPaymentLink).not.toHaveBeenCalled()
     expect(mockCreateJE).not.toHaveBeenCalled()
+  })
+
+  it('books the invoice before the email leaves', async () => {
+    enqueueHappyPath()
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(true)
+    expect(mockCreateJE).toHaveBeenCalledTimes(1)
+    expect(mockCreateJE.mock.invocationCallOrder[0]).toBeLessThan(mockSendEmail.mock.invocationCallOrder[0])
+    expect(findCalls('invoices', 'update')).toEqual([
+      [{ status: 'sent' }],
+      [{ journal_entry_id: 'je-1' }],
+    ])
+  })
+
+  it.each([
+    [
+      'a required dimension on the revenue account',
+      () =>
+        new MandatoryDimensionMissingError([
+          { account_number: '3001', sie_dim_no: '6', dimension_name: 'Projekt' },
+        ]),
+      ['Konto 3001 kräver Projekt'],
+    ],
+    [
+      'a schedule tag whose value has since been archived',
+      () => new DimensionValidationError([{ sie_dim_no: '6', code: 'P009', reason: 'archived_value' }]),
+      // Fragments, not the whole sentence: the engine's wording names the
+      // dimension ("... i dimension 6 är arkiverat") once the dimension
+      // error-message change lands, and this test must hold either way.
+      ['"P009"', 'arkiverat'],
+    ],
+  ])('%s stops the send: no email, the invoice back to draft, the reason on the schedule', async (_label, refusal, reasonFragments) => {
+    enqueueUntilSendPath()
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // status flip draft -> sent
+    enqueue({ data: null, error: null }) // rollback to draft
+    mockCreateJE.mockRejectedValue(refusal())
+    const sentEvents: unknown[] = []
+    eventBus.on('invoice.sent', async (payload) => {
+      sentEvents.push(payload)
+    })
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(false)
+    expect(result.warning).toContain('Auto-utskick stoppades: faktura F-1 kunde inte bokföras')
+    for (const fragment of reasonFragments) expect(result.warning).toContain(fragment)
+    expect(result.warning).toContain('ligger kvar som utkast')
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(mockSendTrackedInvoiceEmail).not.toHaveBeenCalled()
+    expect(findCalls('invoices', 'update')).toEqual([[{ status: 'sent' }], [{ status: 'draft' }]])
+    expect(sentEvents).toEqual([])
+  })
+
+  it('no open fiscal period for the invoice date stops the send the same way', async () => {
+    enqueueUntilSendPath()
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // status flip draft -> sent
+    enqueue({ data: null, error: null }) // rollback to draft
+    mockCreateJE.mockResolvedValue(null)
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(false)
+    expect(result.warning).toContain('Ingen öppen bokföringsperiod')
+    expect(mockSendEmail).not.toHaveBeenCalled()
+  })
+
+  it('an email that fails after issuing leaves the invoice issued and booked, archives its PDF and says so', async () => {
+    enqueueHappyPath()
+    mockSendEmail.mockResolvedValue({ success: false, error: 'SMTP down' })
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(false)
+    expect(result.warning).toContain('Faktura F-1 är utfärdad och bokförd men e-postmeddelandet kunde inte skickas')
+    // No rollback: the verifikat is posted, so the invoice stays issued.
+    expect(findCalls('invoices', 'update')).toEqual([
+      [{ status: 'sent' }],
+      [{ journal_entry_id: 'je-1' }],
+    ])
+    // Finished like mark-sent: the PDF is archived as underlag on the verifikat.
+    expect(mockUploadDocument).toHaveBeenCalledWith(
+      expect.anything(),
+      'user-1',
+      'company-1',
+      expect.objectContaining({ type: 'application/pdf' }),
+      expect.objectContaining({ journal_entry_id: 'je-1' }),
+    )
+  })
+
+  it('with nothing booked (deferred booking) a failed email puts the draft back and keeps the manual-send warning', async () => {
+    enqueueUntilSendPath({ ...company, defer_invoice_booking: true })
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // status flip draft -> sent
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // restore draft (nothing booked)
+    mockSendEmail.mockResolvedValue({ success: false, error: 'SMTP down' })
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(false)
+    expect(result.warning).toBe('Auto-utskick misslyckades: fakturan finns som utkast och kan skickas manuellt.')
+    expect(findCalls('invoices', 'update')).toEqual([[{ status: 'sent' }], [{ status: 'draft' }]])
+    expect(mockUploadDocument).not.toHaveBeenCalled()
+  })
+
+  it('deferred booking (#967) sends without a verifikat, like every other issue path', async () => {
+    enqueueUntilSendPath({ ...company, defer_invoice_booking: true })
+    enqueue({ data: [{ id: 'inv-1' }], error: null }) // status flip draft -> sent
+
+    const result = await executeRecurringSchedule(client, makeSchedule(), today)
+
+    expect(result.autoSent).toBe(true)
+    expect(mockCreateJE).not.toHaveBeenCalled()
+    expect(mockSendEmail).toHaveBeenCalledTimes(1)
   })
 
   it('route-level suppressAutoSend skips the send path without relying on the internal chokepoint', async () => {

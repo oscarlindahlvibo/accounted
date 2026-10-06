@@ -18,14 +18,13 @@ vi.mock('@/lib/currency/riksbanken', () => ({
   fetchExchangeRate: (...args: unknown[]) => mockFetchExchangeRate(...args),
 }))
 
-// Pure account-mapping helpers; mocked to keep the test off the real engine
-// import chain (mirrors the POST route test). buildInvoicePaymentClearingLines
-// and resolveSekAmount are pure and kept real so the preview lines are the
-// genuine ones the dialog would render.
-vi.mock('@/lib/bookkeeping/invoice-entries', () => ({
-  getRevenueAccount: vi.fn().mockReturnValue('3001'),
-  getOutputVatAccount: vi.fn().mockReturnValue('2611'),
-}))
+// The preview renders its rows with the booking's own pure builders
+// (buildInvoiceCashLines, buildInvoiceMatchClearingLines): kept real so the
+// preview lines are the genuine ones the dialog shows and the POST books.
+vi.mock('@/lib/bookkeeping/invoice-entries', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/bookkeeping/invoice-entries')>()
+  return { buildInvoiceCashLines: actual.buildInvoiceCashLines }
+})
 
 vi.mock('@/lib/company/context', () => ({
   getActiveCompanyId: vi.fn().mockResolvedValue('company-1'),
@@ -193,7 +192,11 @@ describe('GET /api/transactions/[id]/match-invoice/preview', () => {
     const bank = body.lines.find((l) => l.account_number === '1930')
     expect(revenue?.credit_amount).toBe(4170) // net subtotal, NOT 3127.5
     expect(vat?.credit_amount).toBe(1042.5)
-    expect(bank?.debit_amount).toBe(5212.5)
+    // The whole-krona bank row (5 213) is what 1930 takes; the 0,50 over the
+    // invoice is öresavrundning on 3740, revenue and moms unchanged.
+    expect(bank?.debit_amount).toBe(5213)
+    const ore = body.lines.find((l) => l.account_number === '3740')
+    expect(ore).toMatchObject({ debit_amount: 0, credit_amount: 0.5 })
   })
 
   // Settlement-account resolution (customer-invoice counterpart of the

@@ -25,12 +25,14 @@ import { AddAccountDialog } from '@/components/bookkeeping/AddAccountDialog'
 import type { CreateArticleInput } from '@/types'
 import { INVOICE_POSTING_ACCOUNT_REGEX } from '@/lib/invoices/posting-account'
 import {
+  GRON_TEKNIK_WORK_TYPES,
   ROT_WORK_TYPES,
   RUT_WORK_TYPES,
+  gronTeknikWorkType,
   normalizeHouseworkType,
 } from '@/lib/invoices/rot-rut-rules'
-import { UNIT_DATALIST_ID, UNIT_MAX_LENGTH } from '@/lib/invoices/units'
-import UnitDatalist from '@/components/invoices/UnitDatalist'
+import { UNIT_MAX_LENGTH } from '@/lib/invoices/units'
+import UnitPicker from '@/components/invoices/UnitPicker'
 
 // A row from the currencies reference table (lib migration
 // 20260630110000_currencies_reference_table.sql).
@@ -235,7 +237,15 @@ export default function ArticleForm({
       revenue_account: data.revenue_account || null,
       cost_price: data.cost_price ?? null,
       ean: data.ean || null,
-      housework_type: type === 'tjanst' ? data.housework_type || null : null,
+      // A service keeps any skattereduktion code; goods keep only a grön
+      // teknik installation type (grön teknik is given on arbete och
+      // material, ROT/RUT on labor only).
+      housework_type:
+        type === 'tjanst'
+          ? data.housework_type || null
+          : gronTeknikWorkType(data.housework_type)
+            ? data.housework_type || null
+            : null,
       notes: data.notes || null,
     })
   }
@@ -314,17 +324,30 @@ export default function ArticleForm({
           align="baseline"
           borderless={!vatRegistered}
         >
-          {/* Free text with suggestions, not a closed list: the API stores any
-              unit up to 32 characters, so a fuel seller types "l" and an
-              article imported with a unit we do not suggest still shows it. */}
-          <SettingsInput
-            id="article-unit"
-            list={UNIT_DATALIST_ID}
-            maxLength={UNIT_MAX_LENGTH}
-            className="w-28 flex-none"
-            {...register('unit')}
+          {/* Every suggested unit plus free text under "Annan enhet": the API
+              stores any unit up to 32 characters, so an article imported with
+              a unit we do not suggest still shows it and keeps it. */}
+          <Controller
+            name="unit"
+            control={control}
+            render={({ field }) => (
+              <UnitPicker
+                ref={field.ref}
+                id="article-unit"
+                // Names the button with its value ("Enhet: st"); the row's
+                // label alone would hide the current unit from a screen reader.
+                aria-label={t('unit_label')}
+                name={field.name}
+                value={field.value}
+                onChange={field.onChange}
+                onBlur={field.onBlur}
+                variant="field"
+                invalid={Boolean(errors.unit)}
+                // The boxed settings-field look (SettingsInput), at its width.
+                className="h-9 w-28 flex-none border-border bg-background px-3 text-[13px] focus-visible:border-foreground/40"
+              />
+            )}
           />
-          <UnitDatalist />
           {fieldError(errors.unit?.message)}
         </SettingsRow>
 
@@ -428,29 +451,33 @@ export default function ArticleForm({
             />
           </SettingsRow>
 
-          {type === 'tjanst' && (
-            <SettingsRow
-              label={t('housework_label')}
-              htmlFor="article-housework"
-              help={t('housework_hint')}
-            >
-              <Controller
-                name="housework_type"
-                control={control}
-                render={({ field }) => (
-                  <SettingsSelect
-                    id="article-housework"
-                    value={field.value || ''}
-                    onChange={(e) => field.onChange(e.target.value)}
-                  >
-                    <option value="">{t('housework_none')}</option>
-                    {legacyHouseworkKind && (
-                      <option value={legacyHouseworkKind}>
-                        {legacyHouseworkKind === 'ROT'
-                          ? t('housework_legacy_rot')
-                          : t('housework_legacy_rut')}
-                      </option>
-                    )}
+          {/* Skattereduktion: a service may carry ROT, RUT or grön teknik;
+              goods only grön teknik (its base is arbete och material). */}
+          <SettingsRow
+            label={t('housework_label')}
+            htmlFor="article-housework"
+            help={type === 'tjanst' ? t('housework_hint') : t('housework_hint_goods')}
+          >
+            <Controller
+              name="housework_type"
+              control={control}
+              render={({ field }) => (
+                <SettingsSelect
+                  id="article-housework"
+                  // Goods cannot keep a ROT/RUT code: show it as "Ingen"
+                  // (it is dropped on save) instead of a value the list lacks.
+                  value={type === 'tjanst' || gronTeknikWorkType(field.value) ? field.value || '' : ''}
+                  onChange={(e) => field.onChange(e.target.value)}
+                >
+                  <option value="">{t('housework_none')}</option>
+                  {type === 'tjanst' && legacyHouseworkKind && (
+                    <option value={legacyHouseworkKind}>
+                      {legacyHouseworkKind === 'ROT'
+                        ? t('housework_legacy_rot')
+                        : t('housework_legacy_rut')}
+                    </option>
+                  )}
+                  {type === 'tjanst' && (
                     <optgroup label={t('housework_rot')}>
                       {ROT_WORK_TYPES.map((w) => (
                         <option key={w.code} value={w.code}>
@@ -458,6 +485,8 @@ export default function ArticleForm({
                         </option>
                       ))}
                     </optgroup>
+                  )}
+                  {type === 'tjanst' && (
                     <optgroup label={t('housework_rut')}>
                       {RUT_WORK_TYPES.map((w) => (
                         <option key={w.code} value={w.code}>
@@ -465,11 +494,18 @@ export default function ArticleForm({
                         </option>
                       ))}
                     </optgroup>
-                  </SettingsSelect>
-                )}
-              />
-            </SettingsRow>
-          )}
+                  )}
+                  <optgroup label={t('housework_gron_teknik')}>
+                    {GRON_TEKNIK_WORK_TYPES.map((w) => (
+                      <option key={w.code} value={w.code}>
+                        {w.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                </SettingsSelect>
+              )}
+            />
+          </SettingsRow>
 
           <SettingsRow label={t('notes_label')} htmlFor="article-notes" align="baseline" borderless>
             <SettingsTextarea

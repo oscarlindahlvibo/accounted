@@ -106,6 +106,51 @@ describe('Skatteverket tools: EXTENSION_DISABLED gate', () => {
   })
 })
 
+describe('VAT tools: period arguments are checked before Skatteverket is called', () => {
+  // tools/call enforces neither `required` nor the period_type enum, and the
+  // handlers used to cast whatever arrived: a call without `year` reached
+  // Skatteverket as redovisningsperiod "undefinedundefined" (7 requests from
+  // 6 companies, each answered 400 and handed back as UNKNOWN_ERROR).
+  const BAD_ARGS: Record<string, unknown>[] = [
+    {},
+    { period_type: 'monthly' },
+    { period_type: 'monthly', year: 2026 },
+    { period_type: 'quarterly', year: 2026, period: 5 },
+    { period_type: 'weekly', year: 2026, period: 1 },
+    { period_type: 'monthly', year: 'twenty', period: 3 },
+  ]
+
+  for (const tool of [validate, vatSubmit, vatStatus]) {
+    it(`${tool.name} answers VALIDATION_ERROR with a working example and makes no SKV call`, async () => {
+      for (const args of BAD_ARGS) {
+        const { supabase } = createQueuedMockSupabase()
+        let thrown: unknown
+        try {
+          await tool.execute(args, 'company-1', 'user-1', supabase as never, { type: 'api_key' })
+        } catch (err) {
+          thrown = err
+        }
+        const err = thrown as Error & { code?: string }
+        expect(err?.code, JSON.stringify(args)).toBe('VALIDATION_ERROR')
+        expect(err.message).toContain('A working call looks like')
+      }
+      expect(mockSkvRequest).not.toHaveBeenCalled()
+      expect(mockBuildMomsuppgift).not.toHaveBeenCalled()
+    })
+  }
+
+  it('accepts yearly without a period number: helårsmoms has one period per year', async () => {
+    mockResolveRedovisare.mockResolvedValue('165560000000')
+    mockSkvRequest.mockResolvedValue({ ok: false, status: 404, text: async () => '', json: async () => ({}) })
+    const { supabase, enqueue } = createQueuedMockSupabase()
+    enqueue({ data: { period_start: '2026-01-01', period_end: '2026-12-31' } })
+    const result = await vatStatus.execute(
+      { period_type: 'yearly', year: 2026 }, 'company-1', 'user-1', supabase as never, { type: 'api_key' },
+    )
+    expect((result as { redovisningsperiod: string }).redovisningsperiod).toBe('202612')
+  })
+})
+
 describe('gnubok_vat_declaration_validate', () => {
   it('maps a SkatteverketAuthError(NOT_CONNECTED) to SKATTEVERKET_NOT_CONNECTED', async () => {
     mockBuildMomsuppgift.mockResolvedValue({ redovisare: '165560000000', redovisningsperiod: '202503', momsuppgift: {} })
@@ -132,6 +177,10 @@ describe('gnubok_vat_declaration_validate', () => {
     // Only /kontrollera was called: nothing was saved at SKV.
     expect(mockSkvRequest).toHaveBeenCalledTimes(1)
     expect(mockSkvRequest.mock.calls[0][4]).toMatch(/^\/kontrollera\//)
+    // The transport audits the call under the tool's existing label.
+    expect(mockSkvRequest.mock.calls[0][5]).toEqual({
+      endpoint: 'kontrollera', agRegistreradId: '165560000000', redovisningsperiod: '202503',
+    })
   })
 })
 
@@ -183,7 +232,7 @@ describe('gnubok_agi_submit', () => {
     enqueue({ data: null }) // no agi_declarations row
     await expect(
       agiSubmit.execute({ salary_run_id: 'sr-1' }, 'company-1', 'user-1', supabase as never, { type: 'api_key' }),
-    ).rejects.toThrow(/AGI-underlag saknas/)
+    ).rejects.toMatchObject({ code: 'AGI_SUBMIT_NOT_GENERATED' })
   })
 })
 
@@ -414,6 +463,10 @@ describe('gnubok_vat_declaration_status: redovisningsperiod follows the räkensk
 
     expect(result.redovisningsperiod).toBe('202612')
     expect(mockSkvRequest.mock.calls.map((c) => c[4])).toEqual(['/inlamnat/165560000000/202612'])
+    // 404 is "nothing on file", audited as ok.
+    expect(mockSkvRequest.mock.calls[0][5]).toEqual({
+      endpoint: 'inlamnat', agRegistreradId: '165560000000', redovisningsperiod: '202612', okStatuses: [404],
+    })
   })
 
   it('yearly with no fiscal year ending in `year` keeps the calendar fallback', async () => {

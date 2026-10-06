@@ -11,6 +11,7 @@ import type {
 } from './compliance-types'
 import { cashFlowOmissionIssues } from './cash-flow-omission'
 import { normalizeOrgNumber } from '@/lib/company-lookup/normalize-org-number'
+import { isEntityType, requiresAuditorRegardlessOfSize } from '@/lib/company/entity-type'
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/
 
@@ -157,6 +158,42 @@ export function validateStatementIntegrity(
   return issues
 }
 
+/**
+ * ABL 25 kap. 13 §: eget kapital below half the registered aktiekapital obliges
+ * the board to draw up a kontrollbalansräkning, and the årsredovisning must say
+ * that one has been or should be drawn up (swedish-financial-reporting: in
+ * förvaltningsberättelsen; under K2 in the note on väsentliga händelser efter
+ * räkenskapsårets slut when drawn up after balansdagen, punkt 18.22; K3 punkt
+ * 3.11).
+ *
+ * A warning, never the kontrollbalans_required flag: whether and when the board
+ * drew one up is not in the books, and the flag prints "upprättats under
+ * räkenskapsåret", which is false for one drawn up after balansdagen (feedback
+ * seq 740922). Keyed on the balance sheet's own Aktiekapital post (2080-2081,
+ * the registered capital): without one there is no aktiekapital to test.
+ */
+function kontrollbalansIssues(report: ArsredovisningData): AnnualReportComplianceIssue[] {
+  const rows = report.balansrakning.equity_liabilities
+  const shareCapital = rows.find((row) => row.semantic_key === 'balance_sheet_share_capital')?.current ?? null
+  const equity = rows.find((row) => row.semantic_key === 'balance_sheet_equity_total')?.current ?? null
+  if (shareCapital === null || equity === null || shareCapital <= 0) return []
+  // Below half, compared in öre: exactly half is not below.
+  if (Math.round(equity * 100) * 2 >= Math.round(shareCapital * 100)) return []
+  const kr = (amount: number) => `${amount.toLocaleString('sv-SE', { maximumFractionDigits: 0 })} kr`
+  const issues: AnnualReportComplianceIssue[] = []
+  push(
+    issues,
+    'AR-EQUITY-BELOW-HALF-SHARE-CAPITAL',
+    'warning',
+    'management_report',
+    `Eget kapital enligt balansräkningen (${kr(equity)}) understiger hälften av det registrerade aktiekapitalet (${kr(shareCapital)}). Styrelsen ska då upprätta en kontrollbalansräkning (ABL 25 kap. 13 §).`,
+    report.accounting_framework === 'k3'
+      ? 'Upplys i förvaltningsberättelsen om att en kontrollbalansräkning har upprättats eller ska upprättas (K3 punkt 3.11).'
+      : 'Upplys i förvaltningsberättelsen om att en kontrollbalansräkning har upprättats eller ska upprättas. Har den upprättats efter balansdagen lämnas upplysningen i not om väsentliga händelser efter räkenskapsårets slut (K2 punkt 18.22).',
+  )
+  return issues
+}
+
 export interface ValidateAnnualReportInput {
   report: ArsredovisningData
   profile: AnnualReportProfile
@@ -219,14 +256,16 @@ export function validateAnnualReportCompleteness(
       'Komplettera företagsinställningarna.',
     )
   }
-  if (!report.company.city?.trim()) {
+  // registered_office is the säte (never the postal town); null means the
+  // company has none and no fallback applied (registered-office.ts).
+  if (!report.company.registered_office?.trim()) {
     push(
       issues,
-      'AR-COMPANY-CITY',
+      'AR-COMPANY-REGISTERED-OFFICE',
       'error',
       'company',
-      'Bolagets registrerade säte saknas.',
-      'Komplettera företagsinställningarna eller hämta grunduppgifter från Bolagsverket.',
+      'Företagets registrerade säte saknas.',
+      'Ange säte under Inställningar → Företag.',
     )
   }
   if (!report.forvaltningsberattelse.description.trim()) {
@@ -258,7 +297,11 @@ export function validateAnnualReportCompleteness(
       'error',
       'management_report',
       'Försiktighetsregeln för föreslagen utdelning är inte bekräftad.',
-      'Bedöm bolagets kapitalbehov, likviditet, ställning och risker enligt ABL 17 kap. 3 §.',
+      // The rule lives in the law of the form: ABL 17 kap. 3 § for an
+      // aktiebolag, EFL 12 kap. 4 § for an ekonomisk förening.
+      report.company.entity_type === 'ekonomisk_forening'
+        ? 'Bedöm föreningens konsolideringsbehov, likviditet, ställning och risker enligt 12 kap. 4 § lagen om ekonomiska föreningar.'
+        : 'Bedöm bolagets kapitalbehov, likviditet, ställning och risker enligt ABL 17 kap. 3 §.',
     )
   }
   if (!profile.narrative_confirmed_at) {
@@ -271,6 +314,7 @@ export function validateAnnualReportCompleteness(
       'Granska texterna och markera dem som bekräftade.',
     )
   }
+  issues.push(...kontrollbalansIssues(report))
 
   issues.push(...validateStatementIntegrity(report))
   if (
@@ -437,7 +481,67 @@ export function validateAnnualReportCompleteness(
         'Årsstämmans alternativa beslut om resultatdisposition saknar text.',
       )
     }
-    if (profile.auditor_report_required && !profile.auditor_report_included) {
+    // ÅRL 6 kap. 3 § p. 1: the förvaltningsberättelse of an ekonomisk
+    // förening must state material changes in the number of members.
+    if (
+      report.company.entity_type === 'ekonomisk_forening' &&
+      !report.forvaltningsberattelse.member_disclosures?.member_count_change?.trim()
+    ) {
+      push(
+        issues,
+        'AR-EF-MEMBER-INFO',
+        'error',
+        'management_report',
+        'Förvaltningsberättelsen saknar uppgift om väsentliga förändringar i medlemsantalet (ÅRL 6 kap. 3 §).',
+      )
+    }
+    // ÅRL 6 kap. 3 § p. 3: when the förening has förlagsinsatser, the
+    // förvaltningsberättelse states the right to dividend they carry. The
+    // PDF prints "uppgift saknas" for an empty text, which would be a
+    // false statement next to a nonzero balance-sheet post.
+    const forlagsinsatserBalance =
+      report.balansrakning.equity_liabilities.find(
+        (row) => row.semantic_key === 'balance_sheet_forlagsinsatser',
+      )?.current ?? 0
+    if (
+      report.company.entity_type === 'ekonomisk_forening' &&
+      forlagsinsatserBalance !== 0 &&
+      !report.forvaltningsberattelse.member_disclosures?.forlagsinsatser_dividend_right?.trim()
+    ) {
+      push(
+        issues,
+        'AR-EF-FORLAGSINSATSER-DIVIDEND',
+        'error',
+        'management_report',
+        'Föreningen har förlagsinsatser men förvaltningsberättelsen saknar uppgift om den rätt till utdelning som de medför (ÅRL 6 kap. 3 §).',
+      )
+    }
+    // ÅRL 6 kap. 3 § p. 2 and 4: the two amounts are statements of fact, so
+    // an unanswered one (null) is not read as "inga". The repayable insatser
+    // are always asked; the redeemable förlagsinsatser only when the förening
+    // has förlagsinsatser, since without any the sum is necessarily nil.
+    const memberDisclosures = report.forvaltningsberattelse.member_disclosures
+    if (
+      report.company.entity_type === 'ekonomisk_forening' &&
+      (memberDisclosures?.insatser_repayable_next_year == null ||
+        (forlagsinsatserBalance !== 0 && memberDisclosures?.forlagsinsatser_redeemable_two_years == null))
+    ) {
+      push(
+        issues,
+        'AR-EF-MEMBER-AMOUNTS',
+        'error',
+        'management_report',
+        'Förvaltningsberättelsen saknar belopp för insatser som ska återbetalas eller förlagsinsatser som ska lösas in (ÅRL 6 kap. 3 §).',
+        'Ange beloppen, eller 0 om det inte finns några.',
+      )
+    }
+    // EFL 8 kap. 1 §: an ekonomisk förening always has a revisor, so the
+    // revisionsberättelse is required whatever the profile answer says.
+    const auditorReportRequired =
+      profile.auditor_report_required ||
+      (isEntityType(report.company.entity_type) &&
+        requiresAuditorRegardlessOfSize(report.company.entity_type))
+    if (auditorReportRequired && !profile.auditor_report_included) {
       push(
         issues,
         'AR-AUDITOR-REPORT-MISSING',

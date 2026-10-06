@@ -109,6 +109,20 @@ vi.mock('@/lib/bookkeeping/account-validation', async () => {
   }
 })
 
+// Already-booked guard: passes by default so the wiring tests keep their query
+// queue; the guard cases switch to the real implementation (useRealGuard).
+const mockAssertBookable = vi.fn()
+vi.mock('@/lib/transactions/is-booked', async (importActual) => ({
+  ...(await importActual<typeof import('@/lib/transactions/is-booked')>()),
+  assertTransactionBookable: (...args: unknown[]) => mockAssertBookable(...args),
+}))
+async function useRealGuard() {
+  const actual = await vi.importActual<typeof import('@/lib/transactions/is-booked')>(
+    '@/lib/transactions/is-booked',
+  )
+  mockAssertBookable.mockImplementation(actual.assertTransactionBookable)
+}
+
 import { POST } from '../route'
 
 describe('POST /api/transactions/[id]/categorize', () => {
@@ -140,6 +154,53 @@ describe('POST /api/transactions/[id]/categorize', () => {
     mockReverseOrphanedJournalEntry.mockResolvedValue(undefined)
     // Default: no covering period at all. The closed-period test overrides this.
     mockCheckPeriodLock.mockResolvedValue({ locked: false, reason: 'no_fiscal_period' })
+    mockAssertBookable.mockResolvedValue({ ok: true })
+  })
+
+  it('returns 409 and books nothing for a row anchored only by a bank_line link (bulk-book, NULL pointer)', async () => {
+    await useRealGuard()
+    enqueue({ data: makeTransaction({ id: 'tx-1', amount: -500, journal_entry_id: null }), error: null })
+    enqueue({ data: [{ journal_entry_id: 'je-samling', role: 'bank_line' }] }) // transaction_voucher_links
+    enqueue({ data: [{ id: 'je-samling', status: 'posted' }] }) // journal_entries
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: { is_business: true, category: 'expense_software' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{
+      error: { code: string; details: Record<string, unknown> }
+    }>(response)
+
+    expect(status).toBe(409)
+    expect(body.error.code).toBe('TRANSACTION_ALREADY_CATEGORIZED')
+    expect(body.error.details).toEqual({ journal_entry_id: 'je-samling', via: 'link' })
+    expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
+    expect(findCalls('transactions', 'update')).toEqual([])
+  })
+
+  it('books a row whose only link names a reversed verifikat (storno released it)', async () => {
+    await useRealGuard()
+    const tx = makeTransaction({ id: 'tx-1', amount: -500, merchant_name: 'GitHub', journal_entry_id: null })
+    enqueue({ data: tx, error: null }) // fetch transaction
+    enqueue({ data: [{ journal_entry_id: 'je-old', role: 'bank_line' }] }) // transaction_voucher_links
+    enqueue({ data: [{ id: 'je-old', status: 'reversed' }] }) // journal_entries
+    enqueue({ data: { entity_type: 'enskild_firma', fiscal_year_start_month: 1 }, error: null }) // settings
+    enqueue({ data: [], error: null }) // resolveSettlementAccount
+    enqueue({ data: [{ id: 'period-1' }], error: null }) // ensureFiscalPeriod
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-new' })
+    mockSaveUserMappingRule.mockResolvedValue(undefined)
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // CAS update
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: { is_business: true, category: 'expense_software' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{ journal_entry_id: string }>(response)
+
+    expect(status, JSON.stringify(body)).toBe(200)
+    expect(body.journal_entry_id).toBe('je-new')
   })
 
   it('delegates the CAS-race orphan to engine-backed storno compensation', async () => {
@@ -1735,7 +1796,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
       error: null,
     })
     // resolveSettlementAccount: the row's own cash account is the live 1940
-    enqueue({ data: { ledger_account: '1940' }, error: null })
+    enqueue({ data: { ledger_account: '1940', currency: 'SEK' }, error: null })
     // Guard: cash_accounts scan + bank_connections status lookup
     enqueue({
       data: [
@@ -1800,7 +1861,7 @@ describe('POST /api/transactions/[id]/categorize', () => {
       },
       error: null,
     })
-    enqueue({ data: { ledger_account: '1940' }, error: null }) // resolveSettlementAccount
+    enqueue({ data: { ledger_account: '1940', currency: 'SEK' }, error: null }) // resolveSettlementAccount
     enqueue({
       data: [
         { id: 'ca-live', ledger_account: '1940', bank_connection_id: 'conn-new', iban: 'SE455', enabled: true, currency: 'SEK' },
@@ -1831,6 +1892,106 @@ describe('POST /api/transactions/[id]/categorize', () => {
     }
     expect(mapping.debit_account).toBe('5010')
     expect(mapping.credit_account).toBe('1940')
+  })
+
+  // Learned dimension bags (D5): a learned code whose value was archived since
+  // is dropped when the template is applied, instead of rejecting the booking.
+  // An explicit pick is the user's decision and passes through untouched.
+  const learnedTemplate = (overrides: Record<string, unknown> = {}) => ({
+    id: '11111111-1111-4111-8111-111111111111',
+    company_id: 'company-1',
+    counterparty_name: 'Telia',
+    counterparty_aliases: [],
+    debit_account: '6200',
+    credit_account: '1930',
+    vat_treatment: null,
+    vat_account: null,
+    category: null,
+    line_pattern: null,
+    occurrence_count: 3,
+    confidence: 0.9,
+    source: 'user_approved',
+    is_active: true,
+    ...overrides,
+  })
+
+  it('drops a learned dimension code the registry has archived and books the active ones', async () => {
+    const tx = makeTransaction({ id: 'tx-1', amount: -1250, merchant_name: 'Telia', journal_entry_id: null })
+
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: learnedTemplate({ default_dimensions: { '1': 'KS01', '6': 'P001' } }), error: null })
+    // Registry check of the learned bag: dimensions enabled, P001 archived.
+    enqueue({ data: { dimensions_enabled: true }, error: null })
+    enqueue({ data: [{ id: 'dim-1', sie_dim_no: 1 }, { id: 'dim-6', sie_dim_no: 6 }], error: null })
+    enqueue({
+      data: [
+        { dimension_id: 'dim-1', code: 'KS01', is_active: true },
+        { dimension_id: 'dim-6', code: 'P001', is_active: false },
+      ],
+      error: null,
+    })
+    enqueue({ data: [], error: null }) // resolveSettlementAccount: no enabled cash accounts -> 1930
+    enqueue({ data: [{ id: 'period-1' }], error: null }) // ensureFiscalPeriod
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // CAS update
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: { is_business: true, counterparty_template_id: '11111111-1111-4111-8111-111111111111' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<unknown>(response)
+
+    expect(status, JSON.stringify(body)).toBe(200)
+    const mapping = mockCreateTransactionJournalEntry.mock.calls[0][4] as { dimensions?: Record<string, string> }
+    expect(mapping.dimensions).toEqual({ '1': 'KS01' })
+  })
+
+  it('never filters an explicit pick: an archived code in body.dimensions reaches the engine, which rejects it', async () => {
+    const tx = makeTransaction({ id: 'tx-1', amount: -1250, merchant_name: 'Telia', journal_entry_id: null })
+
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: learnedTemplate(), error: null }) // no learned bag: no registry read
+    enqueue({ data: [], error: null }) // resolveSettlementAccount
+    enqueue({ data: [{ id: 'period-1' }], error: null }) // ensureFiscalPeriod
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // CAS update
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: {
+        is_business: true,
+        counterparty_template_id: '11111111-1111-4111-8111-111111111111',
+        dimensions: { '6': 'P001' },
+      },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status } = await parseJsonResponse(response)
+
+    expect(status).toBe(200)
+    const mapping = mockCreateTransactionJournalEntry.mock.calls[0][4] as { dimensions?: Record<string, string> }
+    expect(mapping.dimensions).toEqual({ '6': 'P001' })
+  })
+
+  it('returns 404 for a counterparty template that is not an active template of the company', async () => {
+    const tx = makeTransaction({ id: 'tx-1', amount: -1250, merchant_name: 'Telia', journal_entry_id: null })
+
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: null, error: null }) // categorization_templates: not found
+
+    const request = createMockRequest('/api/transactions/tx-1/categorize', {
+      method: 'POST',
+      body: { is_business: true, counterparty_template_id: '11111111-1111-4111-8111-111111111111' },
+    })
+    const response = await POST(request, createMockRouteParams({ id: 'tx-1' }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(404)
+    expect(body.error.code).toBe('NOT_FOUND')
+    expect(mockCreateTransactionJournalEntry).not.toHaveBeenCalled()
   })
 
   it('still books a transfer whose 19xx counter is a live cash account', async () => {
@@ -1872,5 +2033,52 @@ describe('POST /api/transactions/[id]/categorize', () => {
     expect(body.success).toBe(true)
     expect(body.journal_entry_id).toBe('je-1')
     expect(mockCreateTransactionJournalEntry).toHaveBeenCalledTimes(1)
+  })
+
+  // #2919: the category path now adds the 45xx/4598 basis pair for a
+  // reverse-charge purchase. An account_override onto a basis account (the
+  // cost line reports ruta 22 itself) must drop it, or ruta 22 doubles.
+  it.each([
+    ['4531', null, ['2645', '2614']],
+    ['6540', null, ['2645', '2614', '4535', '4598']],
+    ['6541', 'reverse_charge_non_eu_services', ['2645', '2614']],
+  ] as const)('reconciles the reverse-charge basis pair with override %s (treatment %s)', async (account, treatment, expected) => {
+    const tx = makeTransaction({ id: 'tx-1', amount: -250, merchant_name: 'Google Play', journal_entry_id: null })
+    mockBuildMappingResultFromCategory.mockReturnValue({
+      ...defaultMappingResult,
+      debit_account: '5420',
+      credit_account: '1930',
+      vat_lines: [
+        { account_number: '2645', debit_amount: 62.5, credit_amount: 0, description: '' },
+        { account_number: '2614', debit_amount: 0, credit_amount: 62.5, description: '' },
+        { account_number: '4535', debit_amount: 250, credit_amount: 0, description: '' },
+        { account_number: '4598', debit_amount: 0, credit_amount: 250, description: '' },
+      ],
+    })
+
+    enqueue({ data: tx, error: null })
+    enqueue({ data: { entity_type: 'aktiebolag', fiscal_year_start_month: 1 }, error: null })
+    enqueue({ data: [], error: null }) // resolveSettlementAccount: no enabled cash accounts -> 1930
+    enqueue({ data: { account_number: account, account_class: Number(account[0]), default_vat_treatment: treatment }, error: null })
+    enqueue({ data: [{ id: 'period-1' }], error: null }) // ensureFiscalPeriod
+    mockCreateTransactionJournalEntry.mockResolvedValue({ id: 'je-1' })
+    mockSaveUserMappingRule.mockResolvedValue(undefined)
+    enqueue({ data: [{ id: 'tx-1' }], error: null }) // CAS update
+
+    const response = await POST(
+      createMockRequest('/api/transactions/tx-1/categorize', {
+        method: 'POST',
+        body: { is_business: true, category: 'expense_software', vat_treatment: 'reverse_charge', account_override: account },
+      }),
+      createMockRouteParams({ id: 'tx-1' }),
+    )
+    const { status, body } = await parseJsonResponse<unknown>(response)
+    expect(status, JSON.stringify(body)).toBe(200)
+    const mapping = mockCreateTransactionJournalEntry.mock.calls[0][4] as {
+      debit_account: string
+      vat_lines: Array<{ account_number: string }>
+    }
+    expect(mapping.debit_account).toBe(account)
+    expect(mapping.vat_lines.map((l) => l.account_number)).toEqual(expected)
   })
 })

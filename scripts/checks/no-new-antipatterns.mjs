@@ -129,6 +129,23 @@
  *      2026-09-24 scan found the one guarded design rule (radius ladder) clean
  *      and every unguarded one drifted. Implementation, rule list and
  *      rationale in ui-uniformity.mjs. No baseline: the count is 0 today.
+ *   14. table-without-grant: a migration that creates a public table, view or
+ *      sequence without granting it to service_role and authenticated (or a
+ *      reasoned `-- no-grant:` waiver), a serial column without a sequence
+ *      grant, or a bulk grant to the API roles. Since 20260929220000 (and on
+ *      every Supabase project from 2026-10-30) a new table gets no grants by
+ *      default, so it answers 42501 to every supabase-js client. The
+ *      migrations written before that relied on the old default and are
+ *      grandfathered as a file set that never grows. Implementation and
+ *      rationale in table-without-grant.mjs.
+ *   15. uninitialized-event-route: an app/api route whose runtime import
+ *      closure reaches `eventBus.emit` but that never calls
+ *      ensureInitialized() at module scope (in the route file or a module it
+ *      imports), so every event it emits is dropped by the bus (no handler
+ *      registered). withRouteContext does not wire the bus, by design: it
+ *      keeps lib/init out of the cold start of routes that never emit.
+ *      Implementation and rationale in event-route-init.mjs. Allowlisted
+ *      file-set, may only shrink.
  *
  * Usage:
  *   node scripts/checks/no-new-antipatterns.mjs            # check (CI)
@@ -153,10 +170,15 @@ import { findLiteralLegalForms } from './literal-legal-form.mjs'
 import { findClientNodeBuiltins } from './client-node-builtin.mjs'
 import { findAmbiguousEmbeds } from './ambiguous-embed.mjs'
 import { findUiUniformityFindings, UI_UNIFORMITY_HINTS } from './ui-uniformity.mjs'
+import { findTablesWithoutGrant, grandfatheredFiles, grantHint } from './table-without-grant.mjs'
 import {
   findExtensionRouteFindings,
   UNGATED_EXTENSION_ROUTES,
 } from './extension-route-guards.mjs'
+import {
+  findUninitializedEmittingRoutes,
+  UNINITIALIZED_EMITTING_ROUTES,
+} from './event-route-init.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 const SOURCE_ROOT = path.join(ROOT, 'src')
@@ -772,18 +794,21 @@ const PINNED_DEPS = [
   },
   {
     name: 'nodemailer',
-    version: '9.1.1',
+    version: '10.0.13',
     reason:
-      'SMTP mailer for self-hosts (extensions/general/email/lib/smtp-service.ts). Zero-dependency MIT-0 ' +
-      'package on the outbound-mail path; bumps are deliberate, reviewed PRs (audit surface), never silent.',
+      'SMTP mailer for self-hosts (extensions/general/email/lib/smtp-service.ts), and the addressparser ' +
+      'mailparser uses on inbound mail. Zero-dependency MIT-0 package; 10.x requires Node >= 20. Bumps are ' +
+      'deliberate, reviewed PRs (audit surface), never silent (#3298).',
   },
   {
     name: 'mailparser',
-    version: '3.9.20',
+    version: '3.9.32',
     reason:
-      'Inbound-mail parser (extensions/general/invoice-inbox). 3.9.20 is the last release that depends on ' +
-      'nodemailer 9.x; 3.9.21+ pull nodemailer 10 as a second nested copy, which this guard cannot see ' +
-      '(it checks the top-level nodemailer only). Bump both pins together, on purpose (#2490).',
+      'Inbound-mail parser (extensions/general/invoice-inbox). Each mailparser release depends on an EXACT ' +
+      'nodemailer version; 3.9.32 depends on exactly nodemailer 10.0.13, so its nested copy dedupes with the ' +
+      'top-level pin. This guard checks the top-level nodemailer only, so a future mailparser bump must move ' +
+      'the nodemailer pin in the same PR, or a second nested copy appears. Bump both pins together, on ' +
+      'purpose (#2490, #3298).',
   },
 ]
 
@@ -1115,6 +1140,7 @@ const current = {
   rawUserErrors: findRawUserErrors(),
   sekLabelledAmounts: findSekLabelledFxAmounts(SOURCE_ROOT),
   extensionRoutes: findExtensionRouteFindings(SOURCE_ROOT),
+  eventRouteInit: findUninitializedEmittingRoutes(SOURCE_ROOT),
   offLadderRadii: findOffLadderRadii(),
   foldedPublicFlags: findFoldedPublicFlags(),
   dialogOverflowRisk: findDialogOverflowRisks(),
@@ -1124,13 +1150,22 @@ const current = {
   ambiguousEmbeds: findAmbiguousEmbeds(ROOT, SOURCE_ROOT),
   literalLegalForm: findLiteralLegalForms(SOURCE_ROOT),
   uiUniformity: findUiUniformityFindings(SOURCE_ROOT),
+  tableWithoutGrant: findTablesWithoutGrant(ROOT),
 }
 
 const dialogOverflowFiles = [...new Set(current.dialogOverflowRisk.map((f) => f.file))].sort()
+const tableWithoutGrantFiles = [...new Set(current.tableWithoutGrant.map((f) => f.file))].sort()
 
 const isUpdate = process.argv.includes('--update')
 
 if (isUpdate) {
+  // table-without-grant is a frozen set, not a ratchet: --update is run to lock
+  // in some other count going down, and must never grandfather a migration
+  // added since (see grandfatheredFiles).
+  const frozenGrantFiles = fs.existsSync(BASELINE_PATH)
+    ? JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf8')).tableWithoutGrant?.files
+    : undefined
+  const grandfatheredGrantFiles = grandfatheredFiles(frozenGrantFiles, tableWithoutGrantFiles)
   const baseline = {
     _comment:
       'Ratchet baseline for scripts/checks/no-new-antipatterns.mjs. These counts may only decrease. Re-run with --update after a migration lowers them. Goal: both reach 0 (A1 route-auth campaign, D1 rounding codemod).',
@@ -1153,6 +1188,10 @@ if (isUpdate) {
     providerHosts: {
       count: current.providerHosts.length,
       files: current.providerHosts,
+    },
+    tableWithoutGrant: {
+      count: grandfatheredGrantFiles.length,
+      files: grandfatheredGrantFiles,
     },
   }
   fs.writeFileSync(BASELINE_PATH, JSON.stringify(baseline, null, 2) + '\n')
@@ -1443,6 +1482,29 @@ if (newUngatedRoutes.length) {
   )
 }
 
+// 1h. uninitialized-event-route: allowlist lives in event-route-init.mjs
+// (UNINITIALIZED_EMITTING_ROUTES) and may only shrink. The bus drops an event
+// that has no handler, so a route that can emit must have run
+// ensureInitialized() at module scope; withRouteContext does not do it.
+const newUninitializedRoutes = current.eventRouteInit.uninitialized.filter(
+  (f) => !UNINITIALIZED_EMITTING_ROUTES.has(f),
+)
+const initializedSinceBaseline = [...UNINITIALIZED_EMITTING_ROUTES].filter(
+  (f) => !current.eventRouteInit.uninitialized.includes(f),
+)
+if (newUninitializedRoutes.length) {
+  failed = true
+  console.error(
+    `\n✗ uninitialized-event-route: ${newUninitializedRoutes.length} route(s) can emit events but never ` +
+      'wire the event bus, so those events are silently dropped:',
+  )
+  newUninitializedRoutes.forEach((f) => console.error(`    ${f}`))
+  console.error(
+    "  → import { ensureInitialized } from '@/lib/init' and call ensureInitialized() at module\n" +
+      '    scope in the route file (withRouteContext does not wire the bus).',
+  )
+}
+
 // 1c. ledger-scanning-report: any statement generator not in the baseline set
 // is a NEW violation. Grandfathered files stay until they migrate.
 const ledgerScanBaseline = new Set(baseline.ledgerScanningReports?.files ?? [])
@@ -1536,6 +1598,39 @@ if (newDialogOverflow.length) {
   )
 }
 
+// 1e4. table-without-grant: the migrations written against Supabase's old
+// grant-everything default are grandfathered as a file set. Migration files
+// are immutable, so the set never shrinks; any other file with a finding is
+// NEW and fails, whatever its timestamp.
+const tableWithoutGrantBaseline = new Set(baseline.tableWithoutGrant?.files ?? [])
+const newTableWithoutGrant = current.tableWithoutGrant.filter(
+  (f) => !tableWithoutGrantBaseline.has(f.file),
+)
+if (newTableWithoutGrant.length) {
+  failed = true
+  console.error(
+    `\n✗ table-without-grant: ${newTableWithoutGrant.length} relation(s) or grant(s) in new migrations ` +
+      'leave the Data API roles without an explicit, named grant:',
+  )
+  for (const f of newTableWithoutGrant) {
+    const what =
+      f.kind === 'bulk-grant'
+        ? f.detail
+        : f.kind === 'serial-without-grant'
+          ? `public.${f.relation} has a serial column (${f.sequence}; no grant to ${f.roles.join(', ')})`
+          : `public.${f.relation} (${f.relationKind}; no grant to ${f.roles.join(', ')})`
+    console.error(`    ${f.file}:${f.line}  ${what}`)
+    grantHint(f).forEach((l) => console.error(`        ${l}`))
+  }
+  console.error(
+    '  → new public tables get NO grants by default (migration 20260929220000_own_default_privileges;\n' +
+      '    every Supabase project from 2026-10-30), so without the lines above the table answers 42501\n' +
+      '    to every supabase-js client, the service-role one included. Put them in the same migration,\n' +
+      '    after the CREATE. anon gets a grant only when the table is meant to be public. Template:\n' +
+      '    .claude/skills/supabase-migration/SKILL.md.',
+  )
+}
+
 // 1e. literal-legal-form: count may not increase. A legal form named as a
 // string at a call site (see literal-legal-form.mjs) sends every later form
 // down the branch it was not written for; docs/LEGAL-FORMS.md has the
@@ -1612,10 +1707,18 @@ if (gatedSinceBaseline.length) {
   gatedSinceBaseline.forEach((f) => console.log(`    ${f}`))
 }
 
+if (initializedSinceBaseline.length) {
+  console.log(
+    `\n✓ uninitialized-event-route progress: ${initializedSinceBaseline.length} allowlisted route(s) now wire the bus or no longer emit.` +
+      ' Remove them from UNINITIALIZED_EMITTING_ROUTES in scripts/checks/event-route-init.mjs to lock it in:',
+  )
+  initializedSinceBaseline.forEach((f) => console.log(`    ${f}`))
+}
+
 if (failed) {
   console.error('\nAntipattern guard failed: see above.')
   process.exit(1)
 }
 console.log(
-  `\n✓ Antipattern guard passed (raw-route-auth: ${current.rawRouteAuth.length}, naive-ore-round: ${current.naiveOreRound}, hand-rolled-invariant: ${current.handRolledInvariants}, literal-legal-form: ${current.literalLegalForm.length}, ledger-scanning-report: ${current.ledgerScanningReports.length}, direct-jel-insert: 0, direct-invoice-payment-insert: 0, leaky-supabase-client: 0, pinned-dep: 0, raw-user-error: 0, sek-labelled-amount: 0, off-ladder-radius: 0, ui-uniformity: 0, folded-public-flag: 0, cross-extension-import: 0, ungated-extension-route: ${current.extensionRoutes.ungated.length}/${UNGATED_EXTENSION_ROUTES.size} allowlisted, dialog-overflow-risk: ${dialogOverflowFiles.length} file(s), raw-reference-fetch: ${current.rawReferenceFetch.length} file(s), client-node-builtin: ${current.clientNodeBuiltins.length}, ambiguous-embed: ${current.ambiguousEmbeds.length}, provider-host: ${current.providerHosts.length} file(s), direct-ai-client: ${current.directAiClients.length}/${DIRECT_AI_CLIENT_ALLOWED.size} allowlisted).`,
+  `\n✓ Antipattern guard passed (raw-route-auth: ${current.rawRouteAuth.length}, naive-ore-round: ${current.naiveOreRound}, hand-rolled-invariant: ${current.handRolledInvariants}, literal-legal-form: ${current.literalLegalForm.length}, ledger-scanning-report: ${current.ledgerScanningReports.length}, direct-jel-insert: 0, direct-invoice-payment-insert: 0, leaky-supabase-client: 0, pinned-dep: 0, raw-user-error: 0, sek-labelled-amount: 0, off-ladder-radius: 0, ui-uniformity: 0, folded-public-flag: 0, cross-extension-import: 0, ungated-extension-route: ${current.extensionRoutes.ungated.length}/${UNGATED_EXTENSION_ROUTES.size} allowlisted, uninitialized-event-route: ${current.eventRouteInit.uninitialized.length}/${UNINITIALIZED_EMITTING_ROUTES.size} allowlisted, dialog-overflow-risk: ${dialogOverflowFiles.length} file(s), raw-reference-fetch: ${current.rawReferenceFetch.length} file(s), client-node-builtin: ${current.clientNodeBuiltins.length}, ambiguous-embed: ${current.ambiguousEmbeds.length}, provider-host: ${current.providerHosts.length} file(s), table-without-grant: ${tableWithoutGrantFiles.length}/${tableWithoutGrantBaseline.size} grandfathered file(s), direct-ai-client: ${current.directAiClients.length}/${DIRECT_AI_CLIENT_ALLOWED.size} allowlisted).`,
 )

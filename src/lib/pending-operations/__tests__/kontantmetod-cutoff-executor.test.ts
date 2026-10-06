@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PendingOperation } from '@/types'
 
+// i3440-suspension: these tests cover the cut-off itself, which #3440
+// suspends at both doors. They lift the suspension here so the coverage keeps
+// running; the fix PR deletes this mock together with
+// lib/core/bookkeeping/kontantmetod-cutoff-suspension.ts. The suspension's own
+// tests live in kontantmetod-cutoff-suspension.test.ts.
+vi.mock('@/lib/core/bookkeeping/kontantmetod-cutoff-suspension', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/core/bookkeeping/kontantmetod-cutoff-suspension')>()),
+  isKontantmetodCutoffSuspended: () => false,
+}))
+
 vi.mock('@/lib/core/bookkeeping/kontantmetod-cutoff', async () => {
   const actual = await vi.importActual<
     typeof import('@/lib/core/bookkeeping/kontantmetod-cutoff')
@@ -29,6 +39,7 @@ const collection = {
   payables: [],
   unknownVatTreatment: [],
   strayVatOnZeroRate: [],
+  undatedSettlements: [] as string[],
 }
 
 function makePendingOp(overrides: Partial<PendingOperation> = {}): PendingOperation {
@@ -159,6 +170,26 @@ describe('commitPendingOperation: post_kontantmetod_cutoff', () => {
     )
     expect(result).toMatchObject({ status: 'rejected', http_status: 409 })
     expect(result.error).toMatch(/ändrats sedan förhandsgranskningen/i)
+    expect(postKontantmetodCutoff).not.toHaveBeenCalled()
+  })
+
+  // The approver was told which invoices rest on the undated-settlement
+  // assumption. Identical lines on a different assumption are a different
+  // preview, so the frozen approval no longer covers them.
+  it('rejects when the invoices resting on the undated assumption changed after staging', async () => {
+    vi.mocked(assessKontantmetodCutoff).mockResolvedValueOnce({
+      collection: { ...collection, undatedSettlements: ['F-9'] },
+      lines: buildCutoffLines(collection.receivables, collection.payables, 'aktiebolag'),
+      postings: {
+        complete: false, hasAny: false, receivableEntryId: null,
+        receivableReversalId: null, payableEntryId: null, payableReversalId: null,
+        missing: ['receivable', 'receivable_reversal'], duplicates: [],
+      },
+    })
+    const result = await commitPendingOperation(
+      makeSupabase() as never, 'user-1', 'company-1', makePendingOp(),
+    )
+    expect(result).toMatchObject({ status: 'rejected', http_status: 409 })
     expect(postKontantmetodCutoff).not.toHaveBeenCalled()
   })
 

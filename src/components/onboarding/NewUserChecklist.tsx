@@ -26,8 +26,11 @@ import {
 import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-extensions'
 import { useAssistantAvailable, useCapability, useCompanyOptional } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
+import { PROVIDER_DISPLAY_NAMES } from '@/lib/providers/unfinished-connect'
+import type { ProviderName } from '@/lib/providers/types'
 import type { InitialSetupPath, InitialSetupState } from '@/types'
 import { useBranding } from '@/lib/branding/brand-context'
+import { useOmbudAppointWithToasts } from '@/components/skatteverket/ombud-appoint'
 
 interface NewUserChecklistProps {
   initialState: InitialSetupState
@@ -35,6 +38,11 @@ interface NewUserChecklistProps {
   hasBookkeepingImported?: boolean
   hasBankConnected?: boolean
   hasSkatteverketConnected?: boolean
+  /**
+   * Accounted can be the company's ombud (system auth on): the Skatteverket
+   * step appoints it instead of starting an hourly BankID session.
+   */
+  skvOmbudEnabled?: boolean
   hasInboxItems?: boolean
   /** The user holds a live OAuth-minted MCP key, i.e. a Claude (or other
    *  MCP client) connection completed its first sign-in. This is the only
@@ -49,6 +57,10 @@ interface NewUserChecklistProps {
    *  errors > 0 was incomplete (a whole account may have been skipped), so it
    *  also says nothing rather than presenting partial numbers as the result. */
   sieSweep?: { auto_linked: number; suggested: number; unmatched: number; errors: number } | null
+  /** The latest provider connect that never got a token (lib/providers/
+   *  unfinished-connect): the books step offers to retry it or upload a SIE
+   *  file instead. Null = say nothing. */
+  unfinishedConnect?: { provider: ProviderName } | null
 }
 
 /**
@@ -86,10 +98,12 @@ export default function NewUserChecklist({
   hasBookkeepingImported = false,
   hasBankConnected = false,
   hasSkatteverketConnected = false,
+  skvOmbudEnabled = false,
   hasInboxItems = false,
   hasMcpKey = false,
   vatLine = null,
   sieSweep = null,
+  unfinishedConnect = null,
 }: NewUserChecklistProps) {
   const t = useTranslations('initial_setup')
   const locale = useLocale()
@@ -121,6 +135,9 @@ export default function NewUserChecklist({
   // so the one-click Claude path stays the visual primary; at most one open.
   const [sideDoor, setSideDoor] = useState<SideDoor | null>(null)
   const [serverUrlCopied, setServerUrlCopied] = useState(false)
+  const ombud = useOmbudAppointWithToasts((result) => {
+    if (result === 'granted') router.refresh()
+  })
 
   const hasMigration = ENABLED_EXTENSION_IDS.has('arcim-migration')
   const hasBanking = ENABLED_EXTENSION_IDS.has('enable-banking')
@@ -254,11 +271,19 @@ export default function NewUserChecklist({
 
   // Recording the chosen path is owner/admin only; the step itself is not.
   // A member skips the write and goes straight to the step.
-  const goMigration = async () => {
+  // `provider` reopens that provider's connect step (the unfinished-connect
+  // retry); without it the wizard starts at the provider list.
+  const goMigration = async (provider?: ProviderName) => {
     const updated = canRecord ? await persist({ path: 'migration' }, 'migration') : state
     if (updated) {
       captureSetup('onboarding_setup_step_started', { step: 'books', path: 'migration' })
-      router.push(hasMigration ? '/import?mode=migration' : '/import?mode=sie')
+      router.push(
+        !hasMigration
+          ? '/import?mode=sie'
+          : provider
+            ? `/import?mode=migration&provider=${provider}`
+            : '/import?mode=migration',
+      )
     }
   }
   const goFresh = () =>
@@ -359,6 +384,31 @@ export default function NewUserChecklist({
               <span className="text-[11px] text-muted-foreground">{t('step_books_sie')}</span>
             </>
           }
+          footnote={
+            hasMigration && unfinishedConnect ? (
+              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-5">
+                <span>
+                  {t('step_books_unfinished', {
+                    provider: PROVIDER_DISPLAY_NAMES[unfinishedConnect.provider] ?? unfinishedConnect.provider,
+                  })}
+                </span>
+                <button
+                  type="button"
+                  disabled={saving !== null}
+                  onClick={() => void goMigration(unfinishedConnect.provider)}
+                  className="text-muted-foreground underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
+                >
+                  {t('step_books_unfinished_retry')}
+                </button>
+                <Link
+                  href="/import?mode=sie"
+                  className="text-muted-foreground underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
+                >
+                  {t('step_books_unfinished_sie')}
+                </Link>
+              </div>
+            ) : undefined
+          }
         >
           {canRecord ? (
             <>
@@ -428,21 +478,35 @@ export default function NewUserChecklist({
             active={activeStep === 3}
             title={t('step_skv_title')}
             last={lastStep === 'skv'}
-            action={(variant) => (
-              <Button size="sm" variant={variant} asChild>
-                {/* The authorize endpoint redirects off-site to Skatteverket. */}
-                {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
-                <a
-                  href="/api/extensions/ext/skatteverket/authorize?return_to=/"
-                  onClick={() => captureSetup('onboarding_setup_step_started', { step: 'skatteverket' })}
+            action={(variant) =>
+              skvOmbudEnabled ? (
+                <Button
+                  size="sm"
+                  variant={variant}
+                  loading={ombud.linking || ombud.checking}
+                  onClick={() => {
+                    captureSetup('onboarding_setup_step_started', { step: 'skatteverket' })
+                    void ombud.appoint()
+                  }}
                 >
                   {t('step_skv_action')}
-                </a>
-              </Button>
-            )}
+                </Button>
+              ) : (
+                <Button size="sm" variant={variant} asChild>
+                  {/* The authorize endpoint redirects off-site to Skatteverket. */}
+                  {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+                  <a
+                    href="/api/extensions/ext/skatteverket/authorize?return_to=/"
+                    onClick={() => captureSetup('onboarding_setup_step_started', { step: 'skatteverket' })}
+                  >
+                    {t('step_skv_action')}
+                  </a>
+                </Button>
+              )
+            }
             marks={<LogoMark src="/logos/skatteverket_color.svg" name="Skatteverket" />}
           >
-            {t('step_skv_description')}
+            {skvOmbudEnabled ? t('step_skv_description_ombud', { appName }) : t('step_skv_description')}
             {vatLine?.kind === 'date' && (
               <>
                 {' '}

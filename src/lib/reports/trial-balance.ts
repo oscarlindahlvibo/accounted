@@ -153,6 +153,52 @@ async function fetchActivityViaRpc(scope: ActivityScope): Promise<PeriodActivity
 }
 
 /**
+ * The company's reversed year_end entries: the roots whose storno and
+ * correction chain 'exclude-all-year-end' drops with them. Company-wide on
+ * purpose, like the RPC's ye_reversed: a storno in this period can reverse a
+ * year-end entry of another period.
+ */
+export async function fetchReversedYearEndEntryIds(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<string[]> {
+  const rows = await fetchAllRows<{ id: string }>(({ from, to }) =>
+    supabase
+      .from('journal_entries')
+      .select('id')
+      .eq('company_id', companyId)
+      .eq('source_type', 'year_end')
+      .eq('status', 'reversed')
+      .order('id', { ascending: true })
+      .range(from, to)
+  )
+  return rows.map((r) => r.id)
+}
+
+/**
+ * 'exclude-all-year-end' as filters on a journal_entries query: every
+ * source_type 'year_end' entry, and every entry that reverses or corrects
+ * one of `reversedYearEndIds` (fetchReversedYearEndEntryIds). It is the JS
+ * twin of the RPC's 'exclude-all-year-end' branch (get_trial_balance_
+ * aggregates, migration 20260924202408). The entry-lines path below and the
+ * dimension P&L's tagged-line pass (dimension-pnl.ts) both apply it from
+ * here, so the rule has exactly two definitions, this one and the RPC's,
+ * and they change together.
+ */
+export function excludeYearEndChain(
+  query: EntryLinesQuery,
+  reversedYearEndIds: readonly string[],
+): EntryLinesQuery {
+  let q = query.neq('source_type', 'year_end')
+  if (reversedYearEndIds.length > 0) {
+    const idList = `(${reversedYearEndIds.join(',')})`
+    q = q.or(`reverses_id.is.null,reverses_id.not.in.${idList}`)
+    q = q.or(`correction_of_id.is.null,correction_of_id.not.in.${idList}`)
+  }
+  return q
+}
+
+/**
  * The entries 'exclude-final' drops, from the one SQL definition the RPC
  * path uses too (result_closing_entry_ids). Posted entries only, so a
  * reversed closing stays together with its storno.
@@ -177,7 +223,8 @@ async function fetchResultClosingEntryIds(
  * (entries first, then lines chunked by entry id, both paginated), once for
  * the roll-forward slice and once for the period, summed in JS. Verbatim
  * except that 'exclude-final' reads its set from result_closing_entry_ids.
- * Selected by REPORTS_TB_RPC=off only; deleted with the flag.
+ * Selected by REPORTS_TB_RPC=off only; deleted with the flag (the year-end
+ * helpers above stay: the dimension P&L applies them too).
  */
 async function fetchActivityViaEntryLines(
   scope: ActivityScope,
@@ -187,16 +234,6 @@ async function fetchActivityViaEntryLines(
   const { supabase, companyId, fiscalPeriodId, obEntryId, dimensionFilter } = scope
   const excludeAllYearEndEntries = scope.closingEntry === 'exclude-all-year-end'
   const excludeFinalOnly = scope.closingEntry === 'exclude-final'
-
-  const excludeYearEndChain = (query: EntryLinesQuery): EntryLinesQuery => {
-    let q = query.neq('source_type', 'year_end')
-    if (yearEndEntryIds.length > 0) {
-      const idList = `(${yearEndEntryIds.join(',')})`
-      q = q.or(`reverses_id.is.null,reverses_id.not.in.${idList}`)
-      q = q.or(`correction_of_id.is.null,correction_of_id.not.in.${idList}`)
-    }
-    return q
-  }
 
   const closingEntryIds = excludeFinalOnly
     ? await fetchResultClosingEntryIds(supabase, companyId, fiscalPeriodId)
@@ -242,7 +279,7 @@ async function fetchActivityViaEntryLines(
             }
 
             if (excludeAllYearEndEntries) {
-              query = excludeYearEndChain(query)
+              query = excludeYearEndChain(query, yearEndEntryIds)
             }
             if (excludeFinalOnly) {
               query = excludeClosingEntry(query)
@@ -290,7 +327,7 @@ async function fetchActivityViaEntryLines(
         }
 
         if (excludeAllYearEndEntries) {
-          query = excludeYearEndChain(query)
+          query = excludeYearEndChain(query, yearEndEntryIds)
         }
         if (excludeFinalOnly) {
           query = excludeClosingEntry(query)
@@ -348,7 +385,7 @@ export async function generateTrialBalance(
   // for reports that turn out empty or fail the closed-period guard below;
   // that occasional extra read-only query is the price of a short critical
   // path, and the returned data is unchanged.
-  const [periodResult, yearEndIdRows, accounts] = await Promise.all([
+  const [periodResult, yearEndIds, accounts] = await Promise.all([
     supabase
       .from('fiscal_periods')
       .select('period_start, period_end, opening_balance_entry_id, closing_entry_id, is_closed, closed_externally')
@@ -356,17 +393,8 @@ export async function generateTrialBalance(
       .eq('company_id', companyId)
       .single(),
     !viaRpc && excludeAllYearEndEntries
-      ? fetchAllRows<{ id: string }>(({ from, to }) =>
-          supabase
-            .from('journal_entries')
-            .select('id')
-            .eq('company_id', companyId)
-            .eq('source_type', 'year_end')
-            .eq('status', 'reversed')
-            .order('id', { ascending: true })
-            .range(from, to)
-        )
-      : Promise.resolve([] as Array<{ id: string }>),
+      ? fetchReversedYearEndEntryIds(supabase, companyId)
+      : Promise.resolve([] as string[]),
     // Account names for row labelling.
     fetchAllRows<{
       account_number: string
@@ -423,24 +451,24 @@ export async function generateTrialBalance(
   // Wave 2: opening balances (IB) at period_start and the period activity
   // (roll-forward slice + period sums) are independent reads.
   const [obResult, activity] = await Promise.all([
-    getOpeningBalances(supabase, companyId, period),
+    getOpeningBalances(supabase, companyId, period, { dimensions: dimensionFilter }),
     viaRpc
       ? fetchActivityViaRpc(scope)
       : fetchActivityViaEntryLines(
           scope,
           period,
-          yearEndIdRows.map((r) => r.id),
+          yearEndIds,
         ),
   ])
 
-  // A dimension-filtered view cannot use company-wide opening balances (the
-  // OB entry and the prior-period RPC are not dimension-aware). Drop them so
-  // every reported amount is dimension-scoped activity: correct for the P&L
-  // reports the filter is whitelisted for, and never fabricates balances if
-  // misapplied. obEntryId is still needed to exclude the OB entry from lines.
-  const openingBalances = dimensionFilter
-    ? new Map<string, { debit: number; credit: number }>()
-    : obResult.balances
+  // Under a dimension filter the IB is scoped to it as well (issue #3313):
+  // the IB entry's lines tagged with the object, or the prior-history
+  // fallback with the same containment. A project's balance-sheet accounts
+  // open at the project's IB; a filter on a dimension that resets annually
+  // opens at zero (getOpeningBalances reads the registry flag). Result accounts never carry IB, so the P&L
+  // reports built on this are unchanged. obEntryId still excludes the IB
+  // entry from the activity lines.
+  const openingBalances = obResult.balances
 
   // Additively fold the roll-forward activity into openingBalances so the
   // downstream IB/period split stays correct without changing call sites.

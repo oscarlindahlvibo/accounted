@@ -1,5 +1,5 @@
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
-import { bankBookingContext } from '@/lib/bookkeeping/bank-booking-context'
+import { bankBookingContext, booksBankLineInBankDirection } from '@/lib/bookkeeping/bank-booking-context'
 import { NextResponse } from 'next/server'
 import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
@@ -12,10 +12,12 @@ import { bookkeepingErrorResponse } from '@/lib/bookkeeping/errors'
 import { validateBody } from '@/lib/api/validate'
 import { BookTransactionSchema } from '@/lib/api/schemas'
 import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
+import { assertTransactionBookable } from '@/lib/transactions/is-booked'
 import { propagateUnderlagForBookedTransaction } from '@/lib/transactions/inbox-underlag'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
+import { formatCurrency } from '@/lib/utils'
 import type { Transaction } from '@/types'
 
 ensureInitialized()
@@ -41,12 +43,16 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       return NextResponse.json({ error: 'Transaction not found' }, { status: 404 })
     }
 
-    // Reject if already booked
-    if (transaction.journal_entry_id) {
-      return NextResponse.json(
-        { error: 'Transaction already has a journal entry' },
-        { status: 409 }
-      )
+    // Reject if already booked: the pointer OR a bank_line voucher link names a
+    // posted verifikat (a bulk-booked, split or correction-relinked row has a
+    // NULL pointer). A stale pointer at a reversed verifikat does not block;
+    // the locked UPDATE below replaces exactly that observed value.
+    const bookable = await assertTransactionBookable(supabase, companyId, transaction)
+    if (!bookable.ok) {
+      return errorResponseFromCode(bookable.code, log, {
+        requestId,
+        details: { journal_entry_id: bookable.journalEntryId, via: bookable.via },
+      })
     }
 
     // Booking-time duplicate guard: if another transaction with the same
@@ -187,6 +193,23 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       supabase, companyId, repointCashAccountId ?? transaction.cash_account_id, log, transaction.currency,
     )
 
+    // The commit trigger refuses a bank line on the wrong side with a bare
+    // name; say which account and which side while no draft exists yet.
+    if (!booksBankLineInBankDirection(lines, settlementAccount, transaction.amount)) {
+      const withdrawal = transaction.amount < 0
+      const amount = formatCurrency(Math.abs(transaction.amount), transaction.currency)
+      return errorResponseFromCode('TRANSACTION_BOOK_BANK_LINE_DIRECTION', log, {
+        requestId,
+        messageSv: withdrawal
+          ? `Transaktionen är ett uttag på ${amount} från bankkontot, så konto ${settlementAccount} ska stå i kredit. Lägg beloppet i kredit på ${settlementAccount}, eller kontrollera transaktionen om pengarna i själva verket kom in på kontot.`
+          : `Transaktionen är en insättning på ${amount} till bankkontot, så konto ${settlementAccount} ska stå i debet. Lägg beloppet i debet på ${settlementAccount}, eller kontrollera transaktionen om pengarna i själva verket gick ut från kontot.`,
+        messageEn: withdrawal
+          ? `The transaction is a withdrawal of ${amount} from the bank account, so account ${settlementAccount} must be credited. Credit ${settlementAccount}, or check the transaction if the money in fact came into the account.`
+          : `The transaction is a deposit of ${amount} into the bank account, so account ${settlementAccount} must be debited. Debit ${settlementAccount}, or check the transaction if the money in fact left the account.`,
+        details: { settlement_account: settlementAccount, required_side: withdrawal ? 'credit' : 'debit' },
+      })
+    }
+
     // Create journal entry via the engine
     let journalEntry
     try {
@@ -212,8 +235,10 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       )
     }
 
-    // Link transaction to the journal entry
-    const { data: updateResult, error: updateError } = await supabase
+    // Link transaction to the journal entry. CAS on the pointer value read
+    // above (NULL, or a stale pointer at a reversed verifikat), like the
+    // categorize core: a concurrent booking that changed it wins.
+    const linkQuery = supabase
       .from('transactions')
       .update({
         journal_entry_id: journalEntry.id,
@@ -224,8 +249,10 @@ export const POST = withRouteContext<{ params: Promise<{ id: string }> }>(
       })
       .eq('id', id)
       .eq('company_id', companyId)
-      .is('journal_entry_id', null)
-      .select('*')
+    const { data: updateResult, error: updateError } = await (transaction.journal_entry_id
+      ? linkQuery.eq('journal_entry_id', transaction.journal_entry_id)
+      : linkQuery.is('journal_entry_id', null)
+    ).select('*')
 
     if (updateError) {
       await reverseOrphanedJournalEntry(

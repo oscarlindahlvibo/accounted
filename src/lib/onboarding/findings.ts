@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { hasSkatteverketOmbudReadAccess } from '@/lib/skatteverket/ombud-access'
 import type { AiClient } from '@/lib/onboarding/ai-clients'
-import { loadConnectedAiClients } from '@/lib/onboarding/ai-clients.server'
+import { loadAiConnection } from '@/lib/onboarding/ai-clients.server'
 
 /**
  * Genomlysning: what the books act (issue #2438) can say about a company
@@ -53,6 +54,8 @@ export interface BooksFindings {
   ai: {
     /** Clients whose MCP OAuth sign-in this user has completed (a live key with that client). */
     connected: AiClient[]
+    /** Any live OAuth MCP key, also one that names no client (see AiConnection). */
+    agentConnected: boolean
   }
 }
 
@@ -138,7 +141,7 @@ export async function loadBooksFindings(
     // Same predicate as the journal list and the worklist; p_limit only sizes
     // the page, total_count covers the full set.
     supabase.rpc('verifikat_without_documents', { p_company_id: companyId, p_limit: 1, p_offset: 0 }),
-    loadConnectedAiClients(supabase, userId),
+    loadAiConnection(supabase, userId),
   ])
   // A failed read stays an error: it must never surface as a zero balance.
   for (const result of results.slice(0, 11)) {
@@ -148,7 +151,7 @@ export async function loadBooksFindings(
     { count: entryCount }, { data: periodRows }, { count: overdueCount },
     { count: uncategorizedCount }, { data: bankRows }, { count: txCount },
     { data: skvRows }, { data: deadlineRows }, { data: lastEntryRows },
-    { data: summaryData }, { data: underlagData }, connectedAi,
+    { data: summaryData }, { data: underlagData }, aiConnectionRead,
   ] = results
 
   const periods = ((periodRows ?? []) as {
@@ -189,7 +192,11 @@ export async function loadBooksFindings(
   const bank = (bankRows ?? [])[0] as
     | { bank_name: string | null; status: string; last_sie_sweep: { auto_linked?: number; suggested?: number; unmatched?: number } | null }
     | undefined
-  const skvActive = ((skvRows ?? []) as { status: string | null }[]).some((r) => r.status === 'active')
+  // Accounted as ombud counts as connected: its reads need no personal
+  // BankID session. Asked only when no session is active (one lookup less).
+  const skvActive =
+    ((skvRows ?? []) as { status: string | null }[]).some((r) => r.status === 'active') ||
+    (await hasSkatteverketOmbudReadAccess(companyId))
 
   return {
     books: {
@@ -224,6 +231,6 @@ export async function loadBooksFindings(
         dueDate: d.due_date,
       })),
     },
-    ai: { connected: connectedAi },
+    ai: { connected: aiConnectionRead.clients, agentConnected: aiConnectionRead.connected },
   }
 }

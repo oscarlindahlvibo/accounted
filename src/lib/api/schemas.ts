@@ -17,20 +17,25 @@ import {
 } from '@/lib/invariants/zod'
 import { ISO_DATE_RE, ISO_DATE_MESSAGE_SV } from '@/lib/invariants/iso-date'
 import { orgNumberKey } from '@/lib/invariants/org-number'
+import { DIMENSION_RULE_POLICY } from '@/lib/bookkeeping/dimension-rule-policy'
 import { countCalendarMonths } from '@/lib/bookkeeping/accruals/compute'
 import { DimensionsBagSchema } from '@/lib/bookkeeping/dimension-resolver'
+import { DIMENSION_RULE_TYPES, ruleValueProblem } from '@/lib/dimensions/rule-value'
 import { validateEmployeeBankAccount } from '@/lib/salary/payment/bank-account'
 import { validateJamkning } from '@/lib/salary/jamkning-rules'
 import { SalaryCalculationPolicySchema } from '@/lib/salary/calculation-policy'
 import { MAX_INVOICE_EMAIL_COPY_RECIPIENTS } from '@/lib/invoices/email-recipients'
 import { INVOICE_POSTING_ACCOUNT_REGEX } from '@/lib/invoices/posting-account'
 import { computeLineNet } from '@/lib/invoices/line-amounts'
+import { INVOICE_VAT_TREATMENT_OVERRIDES } from '@/lib/invoices/invoice-vat-override'
 import {
+  ARTICLE_HOUSEWORK_TYPE_VALUES,
   DEDUCTION_LINE_ERRORS,
-  HOUSEWORK_TYPE_VALUES,
-  SCHABLON_WORK_TYPES,
-  deductionTypeForWorkType,
+  DEDUCTION_TYPES,
+  HUS_DEDUCTION_TYPES,
+  deductionLineIssues,
   normalizeHouseworkType,
+  type DeductionType,
 } from '@/lib/invoices/rot-rut-rules'
 import { NON_IBAN_CURRENCIES } from '@/lib/invoices/payment-accounts'
 import { PERSONAL_NUMBER_INPUT_RE } from '@/lib/customers/mask-personal-number'
@@ -38,6 +43,7 @@ import {
   COUNTRY_CONSISTENCY_MESSAGES,
   checkCountryConsistency,
   defaultCountryForParty,
+  isAssignedCountryCode,
   normalizeCountryCode,
 } from '@/lib/vat/country-codes'
 import {
@@ -46,7 +52,14 @@ import {
   orgNumberHoldsPersonalNumber,
   personalNumberDigits,
 } from '@/lib/customers/personal-number-shape'
-import { CURRENCIES, type AuditAction, type Currency, type InvoiceDocumentType } from '@/types'
+import {
+  CURRENCIES,
+  INVOICE_QR_MODES,
+  type AuditAction,
+  type Currency,
+  type InvoiceDocumentType,
+  type JournalEntrySourceType,
+} from '@/types'
 import type { BankFileFormatId } from '@/lib/import/bank-file/types'
 import {
   mentionsPeriodPlaceholder,
@@ -419,8 +432,11 @@ export const TaxDeadlineTypeSchema = z.enum([
   'skatteinbetalning',
   'inkomstdeklaration_ef',
   'inkomstdeklaration_ab',
+  'inkomstdeklaration_ekonomisk_forening',
   'arsredovisning',
+  'arsredovisning_ekonomisk_forening',
   'arsstamma',
+  'foreningsstamma',
   'periodisk_sammanstallning',
   'kvarskatt',
 ])
@@ -510,10 +526,11 @@ export const CreateInvoiceItemSchema = z
     // from. Round-tripped on draft edits; the DB trigger refuses a quantity
     // that would over-invoice the order line.
     sales_order_item_id: uuid.nullable().optional(),
-    // ROT/RUT-avdrag fields. `deduction_amount` is intentionally omitted from
-    // the client schema: the API computes it from rot-rut-rules.ts so a
-    // tampered client can't expand the 1513 receivable beyond the line total.
-    deduction_type: z.enum(['rot', 'rut']).nullable().optional(),
+    // Skattereduktion fields (ROT/RUT-avdrag, grön teknik). `deduction_amount`
+    // is intentionally omitted from the client schema: the API computes it
+    // from rot-rut-rules.ts so a tampered client can't expand the 1513
+    // receivable beyond the line total.
+    deduction_type: z.enum(DEDUCTION_TYPES).nullable().optional(),
     labor_hours: z.number().nonnegative().nullable().optional(),
     work_type: z.string().max(64).nullable().optional(),
     housing_designation: z.string().max(128).nullable().optional(),
@@ -555,7 +572,10 @@ export const CreateInvoiceItemSchema = z
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['accrual_period_start'],
-          message: 'ROT/RUT-rader kan inte periodiseras',
+          message:
+            item.deduction_type === 'gron_teknik'
+              ? 'Rader med grön teknik kan inte periodiseras'
+              : 'ROT/RUT-rader kan inte periodiseras',
         })
       }
       // Net of any line discount: a 100 % rebated row has nothing to defer.
@@ -596,31 +616,66 @@ export const SetQuoteStatusSchema = z.object({
 })
 
 /**
- * ROT/RUT claim completeness (HUSFL: art av arbete + antal arbetstimmar) at
- * the invoice level, where document_type is known: only real invoices book a
- * deduction (buildInvoiceWriteData nulls the fields for proformas, delivery
- * notes and quotes), and free-text rows carry no claim. Field-level paths so
- * the editor can point at the row; validateInvoice re-runs the same rules for
- * callers that bypass this schema.
+ * Skattereduktion claim completeness (HUSFL: art av arbete + antal
+ * arbetstimmar; for grön teknik the installation type and the hours per
+ * installation) at the invoice level, where document_type is known: only
+ * real invoices book a deduction (buildInvoiceWriteData nulls the fields for
+ * proformas, delivery notes and quotes), and free-text rows carry no claim.
+ * Field-level paths so the editor can point at the row; validateInvoice
+ * (validateDeductionLines) re-runs the same rules for callers that bypass
+ * this schema.
  */
 function refineRotRutLineCompleteness(
-  data: { document_type?: string; items: Array<{ line_type?: string; deduction_type?: 'rot' | 'rut' | null; work_type?: string | null; labor_hours?: number | null }> },
+  data: { document_type?: string; items: Array<{ line_type?: string; deduction_type?: DeductionType | null; work_type?: string | null; labor_hours?: number | null }> },
   ctx: z.RefinementCtx,
 ): void {
   if (data.document_type && data.document_type !== 'invoice') return
-  data.items.forEach((item, index) => {
-    if (!item.deduction_type || item.line_type === 'text') return
-    const workType = item.work_type?.trim() || null
-    if (!workType) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['items', index, 'work_type'], message: DEDUCTION_LINE_ERRORS.workTypeMissing })
-    } else if (deductionTypeForWorkType(workType) !== item.deduction_type) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['items', index, 'work_type'], message: DEDUCTION_LINE_ERRORS.workTypeMismatch })
-    }
-    const isSchablon = workType != null && SCHABLON_WORK_TYPES.includes(workType)
-    if (!isSchablon && !(typeof item.labor_hours === 'number' && item.labor_hours > 0)) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['items', index, 'labor_hours'], message: DEDUCTION_LINE_ERRORS.hoursMissing })
-    }
-  })
+  for (const issue of deductionLineIssues(data.items)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['items', issue.index, issue.field],
+      message: DEDUCTION_LINE_ERRORS[issue.code],
+    })
+  }
+}
+
+/**
+ * Which payment QR code an invoice PDF prints (migration 20261004004343):
+ * auto (Swish to a private customer when usable, else the bank-app QR, else
+ * Swish, else the payment link), bank_app, swish, payment_link or none.
+ */
+export const InvoiceQrModeSchema = z
+  .enum(INVOICE_QR_MODES)
+  .describe(
+    'Payment QR code on the invoice PDF: auto (Swish to private customers when usable, else bank app, else Swish, else the payment link), bank_app, swish, payment_link or none. An explicit mode that cannot be printed prints no QR.',
+  )
+
+/**
+ * Per-invoice VAT treatment (#2906). Omitted = the customer decides (create)
+ * or the draft keeps what it has (edit); null clears. The two travel as a
+ * pair: sending either replaces both. The rules live in
+ * resolveInvoiceVatRules (lib/invoices/vat-rules.ts), applied by the shared
+ * invoice builder; this is only the wire shape.
+ */
+export const InvoiceVatOverrideShape = {
+  vat_treatment: z
+    .enum(INVOICE_VAT_TREATMENT_OVERRIDES)
+    .nullable()
+    .optional()
+    .describe(
+      "This invoice's own VAT treatment instead of the customer's. standard = Swedish VAT at the line rates (ruta 05). export with delivery_country = export of goods (0 %, 3105, ruta 36); reverse_charge with delivery_country = intra-EU supply of goods (0 %, 3108, ruta 35). Without delivery_country, export / reverse_charge are the services treatments and only accepted where the customer already gets them. Omit to let the customer decide; null clears.",
+    ),
+  delivery_country: z
+    .string()
+    .regex(/^[A-Za-z]{2}$/, 'delivery_country must be an ISO 3166-1 alpha-2 code')
+    .transform((v) => normalizeCountryCode(v) as string)
+    // An unassigned code would read as "outside the EU" and unlock export.
+    .refine(isAssignedCountryCode, 'delivery_country must be an assigned ISO 3166-1 alpha-2 country code')
+    .nullable()
+    .optional()
+    .describe(
+      'ISO 3166-1 alpha-2 country the GOODS are transported to. Setting it declares the invoice a supply of goods; alone it implies the treatment (SE = standard, another EU member state = reverse_charge, elsewhere = export). XI = Northern Ireland (inside the EU for goods). Omit for services.',
+    ),
 }
 
 const CreateInvoiceBaseSchema = z.object({
@@ -665,16 +720,21 @@ const CreateInvoiceBaseSchema = z.object({
   // Per-invoice opt-out for the automatic Stripe payment link on send.
   // Omitted → true (create) / kept as sent by the form (edit).
   payment_link_auto: z.boolean().optional(),
-  // ROT/RUT claim info. The personnummer is plaintext on the wire and gets
-  // encrypted server-side before it ever hits the DB (see encryptPersonnummer
-  // in lib/salary/personnummer.ts). `deduction_housing_designation` is the
-  // fastighetsbeteckning at invoice level: required when any ROT item is
-  // present (enforced via rot-rut-rules.validateInvoice in the API).
+  // The one payment QR code this invoice prints, overriding the company's
+  // invoice_qr_mode. null = inherit the company default; omitted = null on
+  // create and unchanged on a draft edit.
+  qr_mode: InvoiceQrModeSchema.nullable().optional(),
+  // Skattereduktion claim info (ROT/RUT, grön teknik). The personnummer is
+  // plaintext on the wire and gets encrypted server-side before it ever hits
+  // the DB (see encryptPersonnummer in lib/salary/personnummer.ts).
+  // `deduction_housing_designation` is the fastighetsbeteckning at invoice
+  // level: required when any ROT or grön teknik item is present (enforced via
+  // rot-rut-rules.validateInvoice in the API).
   deduction_personnummer: z.string().max(20).optional(),
   deduction_housing_designation: z.string().max(128).optional(),
-  // ROT i bostadsrätt: lägenhetsnummer + föreningens orgnr replace the
+  // Bostadsrätt: lägenhetsnummer + föreningens orgnr replace the
   // fastighetsbeteckning (Begaran.xsd: LagenhetsNr + BrfOrgNr). Stamped onto
-  // the rot lines server-side, same as deduction_housing_designation.
+  // the deduction lines server-side, same as deduction_housing_designation.
   deduction_apartment_number: z.string().max(25).optional(),
   // Same orgnr shape rule as items[].brf_org_number; empty string = not set.
   deduction_brf_org_number: z
@@ -730,6 +790,7 @@ const CreateInvoiceBaseSchema = z.object({
     .transform((v) => v || null)
     .nullable()
     .optional(),
+  ...InvoiceVatOverrideShape,
   items: z.array(CreateInvoiceItemSchema).min(1, 'At least one item is required'),
 })
 
@@ -767,12 +828,84 @@ export const CreateCreditNoteSchema = z.object({
   reason: z.string().optional(),
 })
 
+// A date field of a form being filled in: empty means "not set yet"; an
+// impossible date is refused (the preview renders and fetches a rate for it).
+const previewDate = saneIsoDate.or(z.literal('')).nullish().transform((v) => v || null)
+
+/**
+ * One row of the invoice editor's live preview: the write path's line
+ * (CreateInvoiceItemSchema) without its completeness rules. A row being
+ * typed has no description or price yet, and a cleared number field
+ * arrives as null. Wrong types are still refused.
+ */
+const PreviewInvoiceItemSchema = z.object({
+  line_type: z.enum(['product', 'text']).optional(),
+  description: z.string().max(2000).nullish().transform((v) => v ?? ''),
+  quantity: z.number().nullish().transform((v) => v ?? 0),
+  unit: z.string().max(64).nullish().transform((v) => v ?? ''),
+  unit_price: z.number().nullish().transform((v) => v ?? 0),
+  discount_percent: z.number().min(0).max(100).nullish(),
+  vat_rate: z.number().min(0).max(100).nullish(),
+  deduction_type: z.enum(DEDUCTION_TYPES).nullish(),
+  labor_hours: z.number().nonnegative().nullish(),
+  work_type: z.string().max(64).nullish(),
+  housing_designation: z.string().max(128).nullish(),
+  apartment_number: z.string().max(32).nullish(),
+  brf_org_number: z.string().max(32).nullish(),
+})
+
+/**
+ * POST /api/invoices/preview-pdf (and preview-email): the editor's draft as
+ * it is now, rendered without being saved, from the fields the write path
+ * uses (CreateInvoiceBaseSchema). A live preview renders a half-filled
+ * form: no customer yet, no rows yet and empty dates render with
+ * placeholders (lib/invoices/preview-draft.ts) instead of a 400. A
+ * malformed value (a string quantity, an unknown qr_mode, an impossible
+ * date) is still a 400.
+ *
+ * credited_invoice_id previews the kreditfaktura of that invoice: its rows
+ * and amounts come from the original, as POST /api/invoices creates it, and
+ * notes is the reason printed on it.
+ */
+export const InvoicePreviewSchema = z.object({
+  customer_id: z.union([uuid, z.literal('')]).nullish().transform((v) => v || null),
+  credited_invoice_id: uuid.nullish(),
+  document_type: InvoiceDocumentTypeSchema.optional(),
+  // The predicted number the editor shows ("får nummer N när den skickas").
+  invoice_number: z.string().max(64).nullish(),
+  invoice_date: previewDate,
+  due_date: previewDate,
+  delivery_date: previewDate,
+  valid_until: previewDate,
+  currency: CurrencySchema.optional(),
+  your_reference: z.string().max(500).nullish(),
+  our_reference: z.string().max(500).nullish(),
+  invoice_marking: z.string().max(200).nullish(),
+  notes: z.string().max(10000).nullish(),
+  // Printed only when it is an https address, the shape the write path accepts.
+  payment_link_url: z.string().max(2048).nullish(),
+  payment_cash_account_id: z.union([uuid, z.literal('')]).nullish().transform((v) => v || null),
+  // Empty or null = inherit the company's invoice_qr_mode.
+  qr_mode: z.union([InvoiceQrModeSchema, z.literal('')]).nullish().transform((v) => v || null),
+  ore_rounding: z.boolean().nullish(),
+  ...InvoiceVatOverrideShape,
+  deduction_personnummer: z.string().max(20).nullish(),
+  deduction_housing_designation: z.string().max(128).nullish(),
+  deduction_apartment_number: z.string().max(25).nullish(),
+  deduction_brf_org_number: z.string().max(32).nullish(),
+  items: z.array(PreviewInvoiceItemSchema).max(1000).optional().transform((v) => v ?? []),
+})
+
+export type InvoicePreviewInput = z.infer<typeof InvoicePreviewSchema>
+
 // ============================================================
 // Rot/rut begäran om utbetalning (Skatteverkets husavdragstjänst)
 // ============================================================
 
 export const RotRutPayoutFileSchema = z.object({
-  deduction_type: z.enum(['rot', 'rut']),
+  // The HUS file: ROT and RUT only. Grön teknik is requested in its own
+  // e-tjänst with its own schema, so gron_teknik is a 400 here.
+  deduction_type: z.enum(HUS_DEDUCTION_TYPES),
   invoice_ids: z.array(uuid).min(1).max(500),
   // NamnPaBegaran: the XSD caps it at 16 chars; omitted → generated.
   name: z.string().min(1).max(16).optional(),
@@ -849,8 +982,9 @@ export const ArticleTypeSchema = z.enum(['vara', 'tjanst'])
 
 /**
  * articles.housework_type: a Skatteverket arbetstypskod (BYGG, EL, ..., STAD,
- * TRADGARD, ...) or the bare kind ROT / RUT (deduction only, no arbetstyp
- * pre-fill). Case-insensitive, stored upper-case; '' clears to null. The
+ * TRADGARD, ..., INSTALLATION_SOLCELLER for grön teknik) or the bare kind
+ * ROT / RUT (deduction only, no arbetstyp pre-fill). Case-insensitive, stored
+ * upper-case; '' clears to null. The
  * invoice editor derives a line's skattereduktion from this value, so any
  * other string is a silently dead flag and is rejected here.
  */
@@ -866,7 +1000,7 @@ export const HouseworkTypeSchema = z
     if (!normalized) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: `Ogiltig ROT/RUT-arbetstyp. Tillåtna värden: ${HOUSEWORK_TYPE_VALUES.join(', ')}`,
+        message: `Ogiltig arbetstyp för skattereduktion. Tillåtna värden: ${ARTICLE_HOUSEWORK_TYPE_VALUES.join(', ')}`,
       })
       return z.NEVER
     }
@@ -1133,9 +1267,37 @@ export const InvoicesBulkBookSchema = z.object({
   ids: z.array(z.string().uuid()).min(1).max(200),
 })
 
+export const INVOICE_EMAIL_SUBJECT_MAX_LENGTH = 200
+export const INVOICE_EMAIL_BODY_MAX_LENGTH = 5000
+
+/**
+ * This send's own email subject and message, in place of the company's
+ * texts (Inställningar > Utskick) or the stock texts. For this send only:
+ * never stored on the invoice, though the delivery history keeps the email
+ * as it was sent. Same placeholders as the company texts. Empty or
+ * whitespace-only = no override.
+ */
+export const InvoiceEmailOverrideShape = {
+  email_subject: z
+    .string()
+    .max(INVOICE_EMAIL_SUBJECT_MAX_LENGTH)
+    .nullish()
+    .describe(
+      'This send only: the email subject instead of the company text. Placeholders {fakturanummer}, {kundnamn}, {förnamn}, {företag}, {förfallodatum}, {belopp}. Not stored on the invoice.',
+    ),
+  email_body: z
+    .string()
+    .max(INVOICE_EMAIL_BODY_MAX_LENGTH)
+    .nullish()
+    .describe(
+      'This send only: the message of the email instead of the company text (the greeting and sign-off stay). Same placeholders as email_subject. Not stored on the invoice.',
+    ),
+}
+
 export const SendInvoiceSchema = MarkInvoiceSentSchema.extend({
   additional_cc: invoiceEmailAddressList.optional(),
   additional_bcc: invoiceEmailAddressList.optional(),
+  ...InvoiceEmailOverrideShape,
 }).refine(
   (data) => (
     (data.additional_cc?.length ?? 0) + (data.additional_bcc?.length ?? 0)
@@ -1146,6 +1308,11 @@ export const SendInvoiceSchema = MarkInvoiceSentSchema.extend({
     path: ['additional_cc'],
   },
 )
+
+/** POST /api/invoices/preview-email: the preview draft plus this send's own texts. */
+export const InvoiceEmailPreviewSchema = InvoicePreviewSchema.extend(InvoiceEmailOverrideShape)
+
+export type InvoiceEmailPreviewInput = z.infer<typeof InvoiceEmailPreviewSchema>
 
 // ============================================================
 // Customer schemas
@@ -1616,6 +1783,16 @@ export const MarkSupplierInvoicePaidSchema = z.object({
   amount: z.number().positive().optional(),
   payment_date: isoDate.optional(),
   exchange_rate_difference: z.number().optional(),
+  // #2955: the SEK that actually left the payment account, for a
+  // foreign-currency invoice. The amount cleared off 2440 is read from the
+  // ledger; a difference to it books as kursvinst (3960) or kursförlust (7960).
+  amount_sek: z
+    .number()
+    .positive()
+    .optional()
+    .describe(
+      'Foreign-currency invoices only: the SEK that left the payment account for this payment. Defaults to the SEK the invoice carries on 2440 for the paid share (no kursdifferens); a different figure books the difference on 3960 (gain) or 7960 (loss). Under kontantmetoden (no registration verifikat) it instead translates the whole payment verifikat at the rate it implies. Not combinable with exchange_rate_difference or lines.',
+    ),
   notes: z.string().optional(),
   force: z.boolean().optional(),
   // Which BAS account to credit for the payment. Defaults to 1930 to preserve
@@ -1717,9 +1894,21 @@ export const CreateJournalEntryLineSchema = z.object({
   // over the cost_center/project aliases.
   dimensions: DimensionsBagSchema.optional(),
   // Deprecated aliases for dimensions['1'] / dimensions['6'], kept forever
-  // for API/MCP compatibility.
-  cost_center: z.string().optional(),
-  project: z.string().optional(),
+  // for API/MCP compatibility. They land in the same bag, so they carry the
+  // bag's value rule (and the jel_dimensions_well_formed CHECK): a bad alias
+  // is a 400 here, not a database error at insert. Blank still means untagged.
+  cost_center: z
+    .string()
+    .trim()
+    .max(40, 'Kostnadsställe får vara högst 40 tecken')
+    .regex(/^[^"{}]*$/, 'Kostnadsställe får inte innehålla ", { eller }')
+    .optional(),
+  project: z
+    .string()
+    .trim()
+    .max(40, 'Projekt får vara högst 40 tecken')
+    .regex(/^[^"{}]*$/, 'Projekt får inte innehålla ", { eller }')
+    .optional(),
 }).refine(isSingleSidedLine, SINGLE_SIDED_LINE_ISSUE)
 
 export const CreateJournalEntrySchema = z.object({
@@ -1740,6 +1929,60 @@ export const CreateJournalEntrySchema = z.object({
   voucher_series: z.string().regex(/^[A-Z]$/, 'Verifikationsserie måste vara en bokstav A-Z').optional(),
   notes: z.string().max(2000).optional(),
   lines: z.array(CreateJournalEntryLineSchema).min(2, 'At least two lines are required for double-entry'),
+})
+
+/**
+ * source_type values a caller may put on a voucher it authors through a
+ * generic create door. The label is load-bearing, not decoration: it decides
+ * the dimension-rule and registry-validation exemptions
+ * (lib/bookkeeping/dimension-rules.ts), keeps 'vat_settlement' out of the VAT
+ * return, scopes SIE replacement to 'import' and gates storno/correction
+ * handling. A caller-chosen engine-owned label let a business voucher claim
+ * a policy exemption and show a false source in the ledger.
+ *
+ *   API (v1 POST /journal-entries and /journal-entries/batch-create): every
+ *     source type the dimension-rule policy ENFORCES, plus 'import' for
+ *     history replayed from another system (the documented batch-create use;
+ *     imported history is rule-exempt by design, and the label says so in
+ *     the ledger). Integrations label their own business vouchers with the
+ *     enforced types (a webshop integration posts 'webshop_order' vouchers
+ *     through this door), and those labels claim nothing. The rule-exempt,
+ *     engine-owned types (opening balances, bokslut, storno, corrections,
+ *     credit notes, accruals, settlements, 'system') are refused. Derived
+ *     from DIMENSION_RULE_POLICY, so a new source type is classified once
+ *     there and this door follows.
+ *   Dashboard (POST /api/bookkeeping/journal-entries): 'manual', plus
+ *     'vat_settlement' for the reviewed momsredovisning proposal and VAT
+ *     booking templates (lib/bookkeeping/template-source-type.ts).
+ */
+export const API_VOUCHER_SOURCE_TYPES: readonly JournalEntrySourceType[] = [
+  ...(Object.keys(DIMENSION_RULE_POLICY) as JournalEntrySourceType[]).filter(
+    (sourceType) => DIMENSION_RULE_POLICY[sourceType] === 'enforced'
+  ),
+  'import',
+]
+export const DASHBOARD_VOUCHER_SOURCE_TYPES = ['manual', 'vat_settlement'] as const
+
+/** POST /api/v1/companies/{companyId}/journal-entries (+ batch-create items). */
+export const CreateApiJournalEntrySchema = CreateJournalEntrySchema.extend({
+  source_type: z
+    .enum(API_VOUCHER_SOURCE_TYPES, {
+      error:
+        'source_type kan inte vara en motorägd källtyp här: ingående balans, bokslut, storno, rättelser, ' +
+        'kreditnotor, periodiseringar, avräkningar och systemverifikat sätts av sina egna flöden och undantas ' +
+        `från dimensionsreglerna. Tillåtna värden: ${API_VOUCHER_SOURCE_TYPES.join(', ')}.`,
+    })
+    .default('manual'),
+})
+
+/** POST /api/bookkeeping/journal-entries: what the dashboard's own forms send. */
+export const CreateDashboardJournalEntrySchema = CreateJournalEntrySchema.extend({
+  source_type: z
+    .enum(DASHBOARD_VOUCHER_SOURCE_TYPES, {
+      error:
+        'source_type kan bara vara "manual" eller "vat_settlement" här. Övriga källtyper sätts av sina egna flöden.',
+    })
+    .default('manual'),
 })
 
 export const CorrectJournalEntrySchema = z.object({
@@ -1862,48 +2105,44 @@ export const CreateDimensionSchema = z.object({
   parent_sie_dim_no: z.coerce.number().int().min(1).max(9999).nullable().optional(),
 })
 
-const AccountDimensionRuleTypeSchema = z.enum(['required', 'default', 'fixed'])
+const AccountDimensionRuleTypeSchema = z
+  .enum(DIMENSION_RULE_TYPES)
+  .describe('required: no posting on the account without a value; default: pre-filled when a line has none; fixed: always applied.')
 
 /** GET /api/dimensions/rules query — optional exact-account filter. */
 export const ListDimensionRulesQuerySchema = z.object({
-  account_number: accountNumber.optional(),
+  account_number: accountNumber.optional().describe('Only the rules of this account.'),
 })
 
 /**
  * POST /api/dimensions/rules — per-account dimension policy (dimensions
  * PR10). 'required' carries no value; 'default'/'fixed' must carry the value
- * to apply. One rule per (account, dimension) — enforced by the DB UNIQUE.
+ * to apply (ruleValueProblem, lib/dimensions/rule-value.ts). One rule per
+ * (account, dimension): enforced by the DB UNIQUE. Also the input of the
+ * v1 and MCP doors (operation dimension-rules.create).
  */
 export const CreateAccountDimensionRuleSchema = z
   .object({
     account_number: accountNumber,
-    dimension_id: uuid,
+    dimension_id: uuid.describe('The dimension row id (dimension_id from the dimension list), not its sie_dim_no.'),
     rule_type: AccountDimensionRuleTypeSchema,
-    value_id: uuid.optional(),
-    is_active: z.boolean().optional(),
+    value_id: uuid.optional().describe('default/fixed: the dimension value to apply (dimension_value_id). Omit for required.'),
+    is_active: z.boolean().optional().describe('false saves the rule paused. Default true.'),
   })
   .superRefine((rule, ctx) => {
-    if (rule.rule_type === 'required' && rule.value_id) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['value_id'],
-        message: 'En obligatorisk regel har inget värde — värden hör till Förval/Låst.',
-      })
-    }
-    if (rule.rule_type !== 'required' && !rule.value_id) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['value_id'],
-        message: 'Välj vilket värde regeln ska använda.',
-      })
-    }
+    const problem = ruleValueProblem(rule.rule_type, Boolean(rule.value_id))
+    if (problem) ctx.addIssue({ code: 'custom', path: ['value_id'], message: problem })
   })
 
-/** PATCH /api/dimensions/rules/[id] — the value-presence rule re-checks in the route (partial update). */
+/**
+ * PATCH /api/dimensions/rules/[id]: a partial update, so the value rule is
+ * checked in lib/dimensions/rules-service.ts against the rule's effective
+ * type (the stored one when rule_type is not sent).
+ */
 export const UpdateAccountDimensionRuleSchema = z.object({
   rule_type: AccountDimensionRuleTypeSchema.optional(),
-  value_id: uuid.nullable().optional(),
-  is_active: z.boolean().optional(),
+  value_id: uuid.nullable().optional().describe('The value to apply; null clears it (required rules carry none).'),
+  is_active: z.boolean().optional().describe('false pauses the rule without losing it.'),
 })
 
 export const RetagLineDimensionsSchema = z.object({
@@ -2221,6 +2460,9 @@ export const MatchInvoiceSchema = z
       debit_amount: nonNegativeAmount.default(0),
       credit_amount: nonNegativeAmount.default(0),
       line_description: z.string().optional(),
+      // User-edited payment lines keep their tags, as on mark-paid (without
+      // this key Zod stripped a caller's bag before the route saw it).
+      dimensions: DimensionsBagSchema.optional(),
     }).refine(isSingleSidedLine, SINGLE_SIDED_LINE_ISSUE)).min(2).optional(),
     // Optional caller-supplied SEK-per-invoice-currency rate for cross-currency
     // settlement. Used when the Riksbanken lookup returns nothing (rate not
@@ -2465,6 +2707,8 @@ export const MatchSupplierInvoiceSchema = z.object({
     debit_amount: nonNegativeAmount.default(0),
     credit_amount: nonNegativeAmount.default(0),
     line_description: z.string().optional(),
+    // User-edited payment lines keep their tags, as on mark-paid.
+    dimensions: DimensionsBagSchema.optional(),
   })).min(2).optional(),
 })
 
@@ -2551,7 +2795,7 @@ const InvoicePaymentAccountSchema = z.object({
  * of InvoicePaymentAccountSchema so the settings form, the legacy settings
  * writers and this route agree on what a valid bankgiro is.
  */
-export const UpdateCashAccountSchema = InvoicePaymentAccountSchema.extend({
+export const UpdateCashAccountFieldsSchema = InvoicePaymentAccountSchema.extend({
   voucher_series: UpdateCashAccountVoucherSeriesSchema.shape.voucher_series.optional(),
   name: z.string().trim().min(1).max(100).nullable().optional(),
   invoice_payee: z.boolean().optional(),
@@ -2559,7 +2803,14 @@ export const UpdateCashAccountSchema = InvoicePaymentAccountSchema.extend({
   // enabled state is owned by the AccountPickerDialog (enabled_uids), and
   // setEnabled() refuses it (409), so the shape alone cannot say which.
   enabled: z.boolean().optional(),
-}).strict().refine((body) => Object.keys(body).length > 0, {
+}).strict()
+
+/**
+ * The same fields with the "something to update" rule. Split from
+ * UpdateCashAccountFieldsSchema because a refined object cannot be
+ * extended: the v1 operation adds cash_account_id to the unrefined fields.
+ */
+export const UpdateCashAccountSchema = UpdateCashAccountFieldsSchema.refine((body) => Object.keys(body).length > 0, {
   message: 'Inget att uppdatera',
 })
 
@@ -2570,6 +2821,14 @@ export const CreateCashAccountSchema = z.object({
   ledger_account: z.string().regex(/^19[2-9]\d$/, 'Bankkonton bokförs på 1920-1999').optional(),
   invoice_payee: z.boolean().optional(),
   payee: InvoicePaymentAccountSchema.optional(),
+}).strict()
+
+/**
+ * DELETE /api/cash-accounts/[id]: dry_run=true answers the same checks and
+ * what would go, without writing (the confirmation dialog's preview).
+ */
+export const RemoveCashAccountQuerySchema = z.object({
+  dry_run: z.enum(['true', 'false']).optional(),
 }).strict()
 
 /** PUT /api/cash-accounts/payee-defaults: which account invoices in a currency pay to. */
@@ -2607,6 +2866,9 @@ export const UpdateSettingsSchema = z.object({
   address_line2: z.string().optional(),
   postal_code: z.string().optional(),
   city: z.string().optional(),
+  // Säte: the municipality the company is registered in, printed as säte in
+  // the annual report. Not the postal town (`city`).
+  registered_office: z.string().trim().max(100, 'Säte får vara max 100 tecken').nullable().optional(),
   country: z.string().optional(),
   f_skatt: z.boolean().optional(),
   vat_registered: z.boolean().optional(),
@@ -2714,9 +2976,31 @@ export const UpdateSettingsSchema = z.object({
   invoice_show_bankgiro: z.boolean().optional(),
   invoice_show_plusgiro: z.boolean().optional(),
   invoice_show_swish: z.boolean().optional(),
+  // Superseded by invoice_qr_mode: still accepted (and stored) so existing
+  // API callers keep working, but no longer read when rendering an invoice.
+  // The describe reaches the MCP settings tool and the API skill, so a caller
+  // learns that setting it changes nothing.
+  invoice_show_payment_qr: z
+    .boolean()
+    .optional()
+    .describe('Superseded by invoice_qr_mode: accepted for compatibility, no longer changes the PDF.'),
+  // The one payment QR code invoices print (lib/invoices/payment-qr.ts).
+  invoice_qr_mode: InvoiceQrModeSchema.optional(),
   invoice_show_logo: z.boolean().optional(),
-  invoice_show_company_name: z.boolean().optional(),
-  invoice_company_name_position: z.enum(['header', 'footer']).optional(),
+  // Superseded by the fixed invoice layout (company name in Från and the
+  // footer on every invoice): still accepted and stored so existing callers
+  // keep working, but no settings UI writes them any more. The describe
+  // reaches the MCP settings tool and the API skill.
+  invoice_show_company_name: z
+    .boolean()
+    .optional()
+    .describe(
+      'Superseded by the fixed invoice layout, which always prints the company name in Från and the footer: accepted for compatibility.',
+    ),
+  invoice_company_name_position: z
+    .enum(['header', 'footer'])
+    .optional()
+    .describe('Superseded by the fixed invoice layout: accepted for compatibility, no longer changes the PDF.'),
   invoice_late_fee_text: z.string().nullable().optional(),
   invoice_credit_terms_text: z.string().nullable().optional(),
   // Opt-in for the invoice payment-link feature (editor field + automatic
@@ -2800,6 +3084,10 @@ export const UpdateSettingsSchema = z.object({
   // Öresavrundning: round each net payout up to whole kronor (banks that
   // reject öre in salary payment files). Diff books on 3740.
   salary_net_rounding: z.boolean().optional(),
+  // Payslip sections on the copy the employee receives (migration
+  // 20260930200000). The employer's own view always prints both.
+  salary_payslip_show_employer_cost: z.boolean().optional(),
+  salary_payslip_show_breakdown: z.boolean().optional(),
   // Calculation conventions (migration 20260919120100): partial-month
   // proration, sick-pay rate, long-leave measure, leave context, net and
   // one-off tax rounding. The full object is stored (every key present,
@@ -2873,23 +3161,30 @@ export const CreateDeadlineSchema = z.object({
 })
 
 // ============================================================
-// VAT filing record (issue #2746)
+// VAT filing record (issues #2746, #2786)
 // ============================================================
 
 /**
- * A calendar VAT period: the two cadences whose deadline rows carry the
- * filing record (lib/vat/filing-record.ts). Helårsmoms is deliberately not
- * accepted: its deadline is labelled per räkenskapsår and is completed from
- * the calendar instead.
+ * A VAT period of any cadence, the key of the filing record
+ * (lib/vat/filing-record.ts). Yearly (helårsmoms) is the räkenskapsår, named
+ * like every yearly VAT period: the year it ends in, period 1. Shared by the
+ * dashboard routes and the vat-filings operations (v1 and MCP).
  */
 const vatFilingPeriodShape = {
-  period_type: z.enum(['monthly', 'quarterly']),
-  year: z.coerce.number().int().min(2000).max(2100),
-  period: z.coerce.number().int().min(1).max(12),
+  period_type: z
+    .enum(['monthly', 'quarterly', 'yearly'])
+    .describe('The momsperiod length; yearly is helårsmoms, one period per räkenskapsår.'),
+  year: z.coerce
+    .number()
+    .int()
+    .min(2000)
+    .max(2100)
+    .describe('Calendar year of the period; for yearly, the year the räkenskapsår ends.'),
+  period: z.coerce.number().int().min(1).max(12).describe('1-12 monthly, 1-4 quarterly, 1 yearly.'),
 }
 
 function refineVatFilingPeriod(
-  data: { period_type: 'monthly' | 'quarterly'; period: number },
+  data: { period_type: 'monthly' | 'quarterly' | 'yearly'; period: number },
   ctx: z.RefinementCtx,
 ) {
   if (data.period_type === 'quarterly' && data.period > 4) {
@@ -2897,6 +3192,13 @@ function refineVatFilingPeriod(
       code: 'custom',
       path: ['period'],
       message: 'For quarterly period_type, period must be 1-4.',
+    })
+  }
+  if (data.period_type === 'yearly' && data.period !== 1) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['period'],
+      message: 'For yearly period_type, period must be 1.',
     })
   }
 }
@@ -2907,9 +3209,17 @@ export const MarkVatFilingSchema = z
   .object({
     ...vatFilingPeriodShape,
     /** Swedish calendar date the declaration was filed. */
-    filed_on: saneIsoDate,
+    filed_on: saneIsoDate.describe(
+      'Swedish calendar date the declaration was filed (YYYY-MM-DD): after the period ended, not in the future.',
+    ),
     /** Skatteverket's reference (kvittensnummer); null clears a stored one. */
-    reference: z.string().trim().max(200).nullable().optional(),
+    reference: z
+      .string()
+      .trim()
+      .max(200)
+      .nullable()
+      .optional()
+      .describe("Skatteverket's reference (kvittensnummer). Omit to keep a stored one, null to clear it."),
   })
   .superRefine(refineVatFilingPeriod)
 
@@ -3203,6 +3513,13 @@ export const BehandlingshistorikQuerySchema = z.object({
   format: z.enum(['json', 'csv', 'xlsx', 'pdf']).default('json'),
 })
 
+/** Semesterskuld: as of a fiscal period's end (period_id) or Dec 31 of `year`. */
+export const VacationLiabilityQuerySchema = z.object({
+  period_id: uuid.optional(),
+  year: z.coerce.number().int().min(2000).max(2100).optional(),
+  format: z.enum(['json', 'xlsx', 'pdf']).default('json'),
+})
+
 // ============================================================
 // Voucher gap schemas
 // ============================================================
@@ -3255,6 +3572,17 @@ export const OpeningBalanceCorrectInlineSchema = z
     message: 'Rättelsen måste stryka eller lägga till minst en rad',
   })
 
+/** GET /api/import/opening-balance/split-per-project: the preview's year (#3313). */
+export const OpeningBalanceSplitQuerySchema = z.object({
+  fiscal_period_id: uuid,
+})
+
+/** POST /api/import/opening-balance/split-per-project: apply the previewed split. */
+export const OpeningBalanceSplitApplySchema = z.object({
+  fiscal_period_id: uuid,
+  expected_fingerprint: z.string().min(1).max(64).optional(),
+})
+
 // ============================================================
 // Register import schemas (customers, suppliers)
 // ============================================================
@@ -3263,6 +3591,8 @@ const ImportedCustomerRowSchema = z.object({
   row_index: z.number().int(),
   name: z.string().min(1),
   customer_type: CustomerTypeSchema,
+  // Defaulted so a wizard opened before the field existed can still submit.
+  customer_number: z.string().trim().max(32).nullable().default(null),
   org_number: z.string().nullable(),
   email: z.string().nullable(),
   phone: z.string().nullable(),
@@ -3274,6 +3604,9 @@ const ImportedCustomerRowSchema = z.object({
   vat_number: z.string().nullable(),
   default_payment_terms: z.number().int().min(0).max(365),
   notes: z.string().nullable(),
+  // The existing customer the user said this row is (same name, nothing else
+  // matched). Defaulted like customer_number for an older wizard.
+  confirmed_duplicate_of: z.string().uuid().nullable().default(null),
 }).superRefine((row, ctx) => {
   // The preview flags these rows and the wizard refuses to continue with
   // them; repeated here so a hand-built request cannot import an EU
@@ -3314,6 +3647,9 @@ const ImportedSupplierRowSchema = z.object({
   default_payment_terms: z.number().int().min(0).max(365),
   default_currency: z.string(),
   notes: z.string().nullable(),
+  // The existing supplier the user said this row is (same name, nothing else
+  // matched). Defaulted so an older wizard can still submit.
+  confirmed_duplicate_of: z.string().uuid().nullable().default(null),
 })
 
 export const SupplierImportExecuteSchema = z.object({
@@ -3543,7 +3879,30 @@ export const CreateEmployeeSchema = EmployeeSchemaBase.superRefine((data, ctx) =
 // (salary_type materializes as 'monthly' without monthly_salary present) and
 // (b) leak default values into routes that spread the parsed body into the
 // UPDATE (silently resetting e.g. is_sidoinkomst on unrelated edits).
+//
+// The update contract (#3008): an absent key leaves the column unchanged and
+// an explicit null clears it. Every column that is nullable in the database
+// accepts null here; before, only vacation_pay_rate and jämkning did, so an
+// emptied slutdatum (or email, bank account, ...) had no way to reach the
+// UPDATE and the stored value came back after save. NOT NULL columns keep
+// rejecting null. Cross-field rules on the merged row (a monthly employee
+// needs a salary, A-skatt needs a table, Växa-stöd needs a start date) are
+// checked by every door through lib/salary/employee-update-rules.ts.
 const EmployeeSchemaPatchBase = EmployeeSchemaBase.extend({
+  employment_end: EmployeeSchemaBase.shape.employment_end.nullable(),
+  monthly_salary: EmployeeSchemaBase.shape.monthly_salary.nullable(),
+  hourly_rate: EmployeeSchemaBase.shape.hourly_rate.nullable(),
+  tax_table_number: EmployeeSchemaBase.shape.tax_table_number.nullable(),
+  tax_municipality: EmployeeSchemaBase.shape.tax_municipality.nullable(),
+  clearing_number: EmployeeSchemaBase.shape.clearing_number.nullable(),
+  bank_account_number: EmployeeSchemaBase.shape.bank_account_number.nullable(),
+  email: EmployeeSchemaBase.shape.email.nullable(),
+  phone: EmployeeSchemaBase.shape.phone.nullable(),
+  address_line1: EmployeeSchemaBase.shape.address_line1.nullable(),
+  postal_code: EmployeeSchemaBase.shape.postal_code.nullable(),
+  city: EmployeeSchemaBase.shape.city.nullable(),
+  vaxa_stod_start: EmployeeSchemaBase.shape.vaxa_stod_start.nullable(),
+  vaxa_stod_end: EmployeeSchemaBase.shape.vaxa_stod_end.nullable(),
   employment_type: EmploymentTypeSchema,
   employment_degree: z.number().min(1).max(100),
   hours_per_week: z.number().positive().max(80),
@@ -3560,15 +3919,16 @@ const EmployeeSchemaPatchBase = EmployeeSchemaBase.extend({
 })
 
 export const UpdateEmployeeSchema = EmployeeSchemaPatchBase.partial().superRefine((data, ctx) => {
-  // Only validate salary when salary_type is being changed in this update
-  if (data.salary_type === 'monthly' && data.monthly_salary !== undefined && data.monthly_salary <= 0) {
+  // Only validate salary when salary_type is being changed in this update.
+  // A null amount (clear) counts as missing: the new salary type needs one.
+  if (data.salary_type === 'monthly' && data.monthly_salary !== undefined && (data.monthly_salary ?? 0) <= 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'Månadslön måste vara större än 0 för månadslöneform',
       path: ['monthly_salary'],
     })
   }
-  if (data.salary_type === 'hourly' && data.hourly_rate !== undefined && data.hourly_rate <= 0) {
+  if (data.salary_type === 'hourly' && data.hourly_rate !== undefined && (data.hourly_rate ?? 0) <= 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'Timlön måste vara större än 0 för timlöneform',
@@ -3593,17 +3953,15 @@ export const UpdateEmployeeSchema = EmployeeSchemaPatchBase.partial().superRefin
   }
 
   // Växa-stöd schema-level consistency check. The schema can only see what
-  // the PATCH body carries; the route layer is responsible for merged-
-  // state validation (i.e. an existing employee with vaxa_stod_start
-  // already set can have vaxa_stod_eligible flipped on without also
-  // sending start in the body). What the schema CAN enforce:
+  // the PATCH body carries; merged-state validation (an existing employee
+  // with vaxa_stod_start already set can have vaxa_stod_eligible flipped on
+  // without also sending start in the body, or have start cleared while the
+  // stored flag stays on) is lib/salary/employee-update-rules.ts, run by
+  // every door. What the schema CAN enforce:
   //   - If the body enables vaxa_stod AND clears vaxa_stod_start explicitly
   //     (sending null), reject: that would orphan the eligibility flag.
-  //   - If the body sets vaxa_stod_eligible=true AND vaxa_stod_start is
-  //     present in the body but invalid relative to vaxa_stod_end, reject.
-  // The first case isn't currently expressible via .partial() (null != absent),
-  // so the practical schema-level check is the second one. The route
-  // layer will add a merged-state check when needed.
+  //   - If both dates are in the body, the end may not precede the start
+  //     (a null date skips the ordering check).
   if (
     data.vaxa_stod_eligible === true &&
     'vaxa_stod_start' in data &&
@@ -4247,6 +4605,11 @@ export const CreateExpenseClaimSchema = z
     claimant_name: z.string().trim().max(200).optional(),
     document_id: uuid.optional().nullable(),
     inbox_item_id: uuid.optional().nullable(),
+    /** Kostnadsställe/projekt for the claim's cost lines: the generated cost
+     *  line, or each class 3-8 line of `lines` (a line's own bag wins per key). */
+    dimensions: DimensionsBagSchema.optional().describe(
+      'Dimensions bag {sie_dim_no: code}, e.g. {"6":"P001"}, for the cost line(s). With lines, it is the default for every class 3-8 line; per-line dimensions win per key.',
+    ),
     /** Advanced booking: full verifikat lines in claim currency. Deep
      *  validation (balance, liability line) happens in the service. */
     lines: z
@@ -4256,6 +4619,9 @@ export const CreateExpenseClaimSchema = z
           debit_amount: z.number().nonnegative().default(0),
           credit_amount: z.number().nonnegative().default(0),
           line_description: z.string().trim().max(300).optional().nullable(),
+          // Carried onto the posted line (the service always accepted it;
+          // without it here the bag was silently stripped at the door).
+          dimensions: DimensionsBagSchema.optional(),
         }).refine(isSingleSidedLine, SINGLE_SIDED_LINE_ISSUE),
       )
       .min(2)

@@ -9,8 +9,8 @@ import { formatAmount, formatCurrency, formatDate } from '@/lib/utils'
 import {
   resolveReverseChargeRate,
   isReverseChargeBasisAccount,
-  generateReverseChargeBasisLines,
-  generateReverseChargeLines,
+  generateReverseChargePurchaseLines,
+  reverseChargeKindForSupplierType,
 } from '@/lib/bookkeeping/vat-entries'
 import { generateSlpLines, isSlpPensionAccount } from '@/lib/bookkeeping/slp-lines'
 import { buildSupplierDescription } from '@/lib/bookkeeping/supplier-invoice-description'
@@ -19,6 +19,7 @@ import { isSupplierInvoiceRoundingItem } from '@/lib/supplier-invoices/rounding-
 import { debitNatural } from '@/lib/bookkeeping/line-side'
 import { roundOre } from '@/lib/money'
 import { resolveBookingAccount, itemHasAccrual } from '@/lib/bookkeeping/accruals/account-suggestions'
+import type { InvoiceBookingMoment } from '@/lib/bookkeeping/booking-mode'
 import type { Supplier } from '@/types'
 
 interface ReviewLineItem {
@@ -58,6 +59,13 @@ interface SupplierInvoiceReviewContentProps {
   items: ReviewLineItem[]
   /** Include the invoice rounding in both the payable and journal preview. */
   oreRounding: boolean
+  /**
+   * When the registration verifikat is posted (booking-mode.ts). Only 'issue'
+   * posts it on confirm; under kontantmetoden ('payment') the invoice is
+   * booked at payment as a cash entry with no 2440, and under deferred
+   * booking ('manual') by the explicit Bokför step, so no preview is shown.
+   */
+  bookingMoment: InvoiceBookingMoment
 }
 
 interface JournalPreviewLine {
@@ -147,7 +155,6 @@ function buildJournalPreview(
     // verifikat. ML 16 kap requires both sides reported; silent netting is
     // prohibited (Skatteverket felkod FK004). Driving off the resolved rate (not
     // item.vat_rate) is what makes a 0%-rate RC line book its VAT at all.
-    const isDomesticRC = supplierType === 'swedish_business'
     const rcSupplierType: 'eu_business' | 'non_eu_business' | 'swedish_business' =
       supplierType === 'non_eu_business' || supplierType === 'swedish_business'
         ? supplierType
@@ -174,24 +181,18 @@ function buildJournalPreview(
       // Same generator the engine calls, so the account pair AND the
       // "Fiktiv in-/utgående moms" wording come from one place instead of
       // being re-derived here (they used to render as bare account numbers).
-      for (const rcLine of generateReverseChargeLines(netAmount, rate, isDomesticRC)) {
+      for (const rcLine of generateReverseChargePurchaseLines({
+        base: netAmount,
+        rate,
+        kind: reverseChargeKindForSupplierType(rcSupplierType),
+        basisBase: nonBasisBaseByRate.get(rate) || 0,
+      })) {
         lines.push({
           account_number: rcLine.account_number,
           description: rcLine.line_description ?? rcLine.account_number,
           debit: rcLine.debit_amount,
           credit: rcLine.credit_amount,
         })
-      }
-      const nonBasisBase = nonBasisBaseByRate.get(rate) || 0
-      if (nonBasisBase > 0) {
-        for (const bl of generateReverseChargeBasisLines(nonBasisBase, rate, rcSupplierType)) {
-          lines.push({
-            account_number: bl.account_number,
-            description: bl.line_description ?? bl.account_number,
-            debit: bl.debit_amount,
-            credit: bl.credit_amount,
-          })
-        }
       }
     }
 
@@ -250,6 +251,7 @@ export function SupplierInvoiceReviewContent({
   paymentReference,
   items,
   oreRounding,
+  bookingMoment,
 }: SupplierInvoiceReviewContentProps) {
   const t = useTranslations('supplier_invoice_editor')
   const { itemTotals, subtotal, totalVat, total, figures, roundingItem } = supplierInvoiceEditorAmounts(
@@ -273,7 +275,11 @@ export function SupplierInvoiceReviewContent({
     vat_rate: reverseCharge ? 0 : item.vat_rate,
     vat_amount: reverseCharge ? 0 : itemTotals[index].vatAmount,
   }))
-  const journalLines = buildJournalPreview(
+  // Only a confirm that posts the registration verifikat gets its preview:
+  // under kontantmetoden or deferred booking the 2440 shape below is never
+  // written at registration.
+  const showsVoucher = bookingMoment === 'issue'
+  const journalLines = !showsVoucher ? [] : buildJournalPreview(
     roundingItem ? [...previewItems, roundingItem] : previewItems,
     roundOre(subtotal + (roundingItem?.amount ?? 0)),
     totalVat,
@@ -442,79 +448,85 @@ export function SupplierInvoiceReviewContent({
       </div>
 
       {/* Verifikation preview */}
-      <div className="bg-muted/50 border rounded-lg p-3 sm:p-4 space-y-2">
-        <p className="text-sm font-semibold text-muted-foreground">
-          {t('review_voucher_preview_title')}
-          {showingSek && (
-            <span className="ml-1.5 font-normal text-xs">{t('review_voucher_in_sek_suffix')}</span>
-          )}
-        </p>
-        <div className="hidden sm:block">
-          <table className="w-full text-sm">
-            <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
-              <tr className="text-left">
-                <th className="pb-1 w-16">{t('col_account')}</th>
-                <th className="pb-1">{t('col_description')}</th>
-                <th className="pb-1 w-24 text-right">{t('col_debit')}</th>
-                <th className="pb-1 w-24 text-right">{t('col_credit')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {journalLines.map((line, index) => (
-                <tr key={index} className="border-b border-dashed border-muted-foreground/20 last:border-0">
-                  <td className="py-1">
-                    <AccountNumber number={line.account_number} size="sm" />
-                  </td>
-                  <td className="py-1 text-xs">
-                    {line.description}
-                  </td>
-                  <td className="py-1 text-right tabular-nums">
-                    {line.debit > 0 ? formatAmount(line.debit) : ''}
-                  </td>
-                  <td className="py-1 text-right tabular-nums">
-                    {line.credit > 0 ? formatAmount(line.credit) : ''}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-            <tfoot>
-              <tr className="border-t font-semibold">
-                <td className="pt-1" colSpan={2}>{t('sum_label')}</td>
-                <td className="pt-1 text-right tabular-nums">{formatAmount(totalDebit)}</td>
-                <td className="pt-1 text-right tabular-nums">{formatAmount(totalCredit)}</td>
-              </tr>
-            </tfoot>
-          </table>
-        </div>
-        <div className="sm:hidden space-y-1.5 text-sm">
-          {journalLines.map((line, index) => (
-            <div key={index} className="flex items-center justify-between py-1 border-b border-dashed border-muted-foreground/20 last:border-0">
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <AccountNumber number={line.account_number} size="sm" />
-                  <span className="text-xs text-muted-foreground truncate">
-                    {line.description}
-                  </span>
-                </div>
-              </div>
-              <span className="tabular-nums text-xs shrink-0 ml-2">
-                {line.debit > 0 ? t('debit_short', { amount: formatAmount(line.debit) }) : t('credit_short', { amount: formatAmount(line.credit) })}
-              </span>
-            </div>
-          ))}
-          <div className="flex justify-between pt-1 border-t font-semibold text-xs tabular-nums">
-            <span>{t('sum_label')}</span>
-            <span>{t('debit_credit_short', { debit: formatAmount(totalDebit), credit: formatAmount(totalCredit) })}</span>
-          </div>
-        </div>
-        {figures.rounding.applies && (
-          <p className="text-xs text-muted-foreground">
-            {t('review_ore_rounding_note', {
-              delta: formatCurrency(figures.rounding.roundingDelta, currency),
-            })}
+      {showsVoucher ? (
+        <div className="bg-muted/50 border rounded-lg p-3 sm:p-4 space-y-2">
+          <p className="text-sm font-semibold text-muted-foreground">
+            {t('review_voucher_preview_title')}
+            {showingSek && (
+              <span className="ml-1.5 font-normal text-xs">{t('review_voucher_in_sek_suffix')}</span>
+            )}
           </p>
-        )}
-      </div>
+          <div className="hidden sm:block">
+            <table className="w-full text-sm">
+              <thead className="[&_th]:font-medium [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wider [&_th]:text-muted-foreground">
+                <tr className="text-left">
+                  <th className="pb-1 w-16">{t('col_account')}</th>
+                  <th className="pb-1">{t('col_description')}</th>
+                  <th className="pb-1 w-24 text-right">{t('col_debit')}</th>
+                  <th className="pb-1 w-24 text-right">{t('col_credit')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {journalLines.map((line, index) => (
+                  <tr key={index} className="border-b border-dashed border-muted-foreground/20 last:border-0">
+                    <td className="py-1">
+                      <AccountNumber number={line.account_number} size="sm" />
+                    </td>
+                    <td className="py-1 text-xs">
+                      {line.description}
+                    </td>
+                    <td className="py-1 text-right tabular-nums">
+                      {line.debit > 0 ? formatAmount(line.debit) : ''}
+                    </td>
+                    <td className="py-1 text-right tabular-nums">
+                      {line.credit > 0 ? formatAmount(line.credit) : ''}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr className="border-t font-semibold">
+                  <td className="pt-1" colSpan={2}>{t('sum_label')}</td>
+                  <td className="pt-1 text-right tabular-nums">{formatAmount(totalDebit)}</td>
+                  <td className="pt-1 text-right tabular-nums">{formatAmount(totalCredit)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+          <div className="sm:hidden space-y-1.5 text-sm">
+            {journalLines.map((line, index) => (
+              <div key={index} className="flex items-center justify-between py-1 border-b border-dashed border-muted-foreground/20 last:border-0">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <AccountNumber number={line.account_number} size="sm" />
+                    <span className="text-xs text-muted-foreground truncate">
+                      {line.description}
+                    </span>
+                  </div>
+                </div>
+                <span className="tabular-nums text-xs shrink-0 ml-2">
+                  {line.debit > 0 ? t('debit_short', { amount: formatAmount(line.debit) }) : t('credit_short', { amount: formatAmount(line.credit) })}
+                </span>
+              </div>
+            ))}
+            <div className="flex justify-between pt-1 border-t font-semibold text-xs tabular-nums">
+              <span>{t('sum_label')}</span>
+              <span>{t('debit_credit_short', { debit: formatAmount(totalDebit), credit: formatAmount(totalCredit) })}</span>
+            </div>
+          </div>
+          {figures.rounding.applies && (
+            <p className="text-xs text-muted-foreground">
+              {t('review_ore_rounding_note', {
+                delta: formatCurrency(figures.rounding.roundingDelta, currency),
+              })}
+            </p>
+          )}
+        </div>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          {bookingMoment === 'payment' ? t('review_books_at_payment') : t('review_books_on_book_step')}
+        </p>
+      )}
 
       {/* Payment reference */}
       {paymentReference && (

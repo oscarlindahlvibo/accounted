@@ -88,9 +88,15 @@ describe('measured-gap templates', () => {
     expect(BOOKING_TEMPLATES.some((t) => t.debit_account.startsWith('4'))).toBe(true)
   })
 
-  it('the owner and placement templates are AB only', () => {
-    for (const id of ['share_capital_deposit', 'shareholder_contribution', 'dividend_paid', 'capital_insurance_deposit', 'securities_purchase']) {
+  it('the owner templates are AB only; placements belong to every juridisk person', () => {
+    for (const id of ['share_capital_deposit', 'shareholder_contribution', 'dividend_paid']) {
       expect(getTemplateById(id)!.entity_applicability, id).toBe('aktiebolag')
+    }
+    // Kapitalförsäkring and securities are placements of the company's own
+    // money: an ekonomisk förening makes them like an AB; an enskild firma
+    // books them privately.
+    for (const id of ['capital_insurance_deposit', 'securities_purchase']) {
+      expect(getTemplateById(id)!.entity_applicability, id).toEqual(['aktiebolag', 'ekonomisk_forening'])
     }
   })
 })
@@ -127,6 +133,12 @@ describe('matcher finds the gap templates from bank text', () => {
 
   it('routes a state grant to bidrag', () => {
     expect(top('TILLVÄXTVERKET PROJEKTBIDRAG', 50000)).toBe('grant_received')
+  })
+
+  it('routes a gym to Friskvård, but not a massage, which its own rule puts at 25 % against the 6 % it books (PostHog PH 118)', () => {
+    expect(top('NORDIC WELLNESS GBG', -499)).toBe('personnel_wellness')
+    const massage = makeTransaction({ description: 'IDROTTSMASSAGE STHLM', original_description: 'IDROTTSMASSAGE STHLM', merchant_name: null, amount: -1000 })
+    expect(findMatchingTemplates(massage).map((m) => m.template.id)).not.toContain('personnel_wellness')
   })
 
   it('leaves the default fixture (a grocery store) without a refreshments match', () => {

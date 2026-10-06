@@ -24,8 +24,9 @@ import { persistUiState } from '@/lib/ui-state/client'
 import { TX_COLUMNS, resolveTxColumns, type TxColumnId } from '@/lib/transactions/columns-v2'
 import { SKATTEKONTO_ACCOUNT } from '@/lib/skatteverket/manual-verifikat-prefill'
 import { CategoryPopover } from '@/components/transactions/CategoryPopover'
-import { bankLogoUrl } from '@/lib/reconciliation/bank-logos'
+import { cashAccountKontoLabel, cashAccountLogoUrl } from '@/lib/cash-accounts/labels'
 import type { RowProposal } from '@/components/transactions/TransactionInboxCard'
+import { underlagForReview, type CarriedUnderlag, type ReviewUnderlag } from '@/components/transactions/review-underlag'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import TransactionStatusBar from '@/components/transactions/TransactionStatusBar'
 import { BankgiroNotificationDialog } from '@/components/reconciliation/BankgiroNotificationDialog'
@@ -101,7 +102,7 @@ import { getErrorMessage } from '@/lib/errors/get-error-message'
 import { resolveDetachErrorMessage } from '@/components/transactions/detach-underlag'
 import { cn, formatCurrency, formatDate } from '@/lib/utils'
 import { roundOre } from '@/lib/money'
-import type { TransactionCategory, CreateTransactionInput, Invoice, Customer, SupplierInvoice, Supplier, VatTreatment, EntityType, BookingTemplateLibrary } from '@/types'
+import type { TransactionCategory, CreateTransactionInput, Invoice, Customer, SupplierInvoice, Supplier, VatTreatment, EntityType, BookingTemplateLibrary, DeductionType } from '@/types'
 import { mutate as globalMutate } from 'swr'
 import { rowProposal, type SuggestedTemplate } from '@/lib/transactions/category-suggestions'
 import { readIsFresh, type AssistantRead } from '@/lib/agent/categorize/read-shape'
@@ -395,7 +396,7 @@ async function fetchPotentialMatches(
   const rotRutRequests: PotentialRotRutPayoutRequest[] = ((rotRutResult.data ?? []) as Array<{
     id: string
     name: string
-    deduction_type: 'rot' | 'rut'
+    deduction_type: DeductionType
     status: string
     requested_total: number | string
     decided_total: number | string | null
@@ -462,6 +463,8 @@ interface QuickReviewState {
   proposal: BookingProposal
   /** The person chose it from the picker, as opposed to the row's recommendation. */
   picked: boolean
+  /** Underlag attached in the review that "Byt" closed, carried into this one. */
+  underlag: ReviewUnderlag | null
 }
 
 export default function TransactionsPage() {
@@ -558,6 +561,9 @@ export default function TransactionsPage() {
   const [templatePickerTransaction, setTemplatePickerTransaction] = useState<TransactionWithInvoice | null>(null)
   // The element the picker opens beside (chip or Bokför button); null = the dialog.
   const [templatePickerAnchor, setTemplatePickerAnchor] = useState<HTMLElement | null>(null)
+  // The underlag "Byt" took from the review it closed, for the review this
+  // picker opens on the same row (review-underlag.ts underlagForReview).
+  const [templatePickerUnderlag, setTemplatePickerUnderlag] = useState<CarriedUnderlag | null>(null)
   // The picker renders non-modal (agent sheet stays usable); hand-restore
   // page modality while it is open. See useDashShellInert in ui/dialog.tsx.
   useDashShellInert(templatePickerOpen)
@@ -763,20 +769,18 @@ export default function TransactionsPage() {
   // and seeded by the dashboard layout (lib/reference-data), so the chooser
   // renders populated on the first paint. Bank sync invalidates the entry.
   const { cashAccounts } = useCashAccounts({ enabledOnly: true })
-  // v2 column texts. Konto = bank plus the account's last digits (or its
-  // ledger account); Kategori = the match hint the row already carries, or
-  // null so the cell prompts "Välj kategori".
+  // v2 column texts. Konto = the account's bank plus its last digits (or its
+  // ledger account), from lib/cash-accounts/labels.ts: the connection's bank,
+  // never the payee columns an invoice prints. Kategori = the match hint the
+  // row already carries, or null so the cell prompts "Välj kategori".
   const accountLabelFor = (tx: TransactionWithInvoice): string | null => {
     const acct = tx.cash_account_id ? cashAccounts.find((a) => a.id === tx.cash_account_id) : undefined
-    if (!acct) return null
-    const bank = acct.bank_name || acct.name || ''
-    const tail = acct.account_number ? `••${acct.account_number.slice(-4)}` : acct.ledger_account
-    return `${bank} ${tail}`.trim()
+    return acct ? cashAccountKontoLabel(acct) : null
   }
   // The brand mark next to the Konto text (bank, Stripe, Skatteverket).
   const accountLogoFor = (tx: TransactionWithInvoice): string | null => {
     const acct = tx.cash_account_id ? cashAccounts.find((a) => a.id === tx.cash_account_id) : undefined
-    return acct ? bankLogoUrl(acct.bank_name, acct.name) : null
+    return acct ? cashAccountLogoUrl(acct) : null
   }
   // The top suggestion (counterparty template, then keyword/MCC)
   // stands in the Kategori cell so the person sees what Bokför will do
@@ -3473,7 +3477,9 @@ export default function TransactionsPage() {
                 ? t('skv_err_not_settled')
                 : code === 'COMMIT_FAILED'
                   ? t('skv_err_commit_failed')
-                  : t('skv_err_other')
+                  : code === 'LEDGER_TWIN_EXISTS'
+                    ? t('skv_err_ledger_twin')
+                    : t('skv_err_other')
       const parts = [t('skv_bulk_partial_ok', { count: succeeded })]
       for (const [code, n] of codeCounts) parts.push(`${n} ${codeLabel(code)}`)
       toast({
@@ -4054,13 +4060,22 @@ export default function TransactionsPage() {
   function openCategoryDialog(transaction: TransactionWithInvoice, anchor?: HTMLElement) {
     setTemplatePickerTransaction(transaction)
     setTemplatePickerAnchor(anchor ?? null)
+    // Opened from the row, not by "Byt": no review's underlag to carry.
+    setTemplatePickerUnderlag(null)
     setTemplatePickerOpen(true)
   }
 
   // The one door into the review: a proposal, and whether the person picked it.
+  // Opened from the picker "Byt" opened, it gets the underlag the closed
+  // review held; every other way in starts without one.
   function openReview(transaction: TransactionWithInvoice, proposal: BookingProposal, picked: boolean) {
+    const underlag = underlagForReview(templatePickerUnderlag, {
+      transactionId: transaction.id,
+      fromPicker: templatePickerOpen,
+    })
     setTemplatePickerOpen(false)
-    setQuickReview({ transaction, proposal, picked })
+    setTemplatePickerUnderlag(null)
+    setQuickReview({ transaction, proposal, picked, underlag })
     setQuickReviewOpen(true)
   }
 
@@ -4128,10 +4143,13 @@ export default function TransactionsPage() {
     openReview(transaction, proposal, true)
   }
 
-  function handleChangeTemplate() {
+  // "Byt": the review closes for the picker and hands over the underlag
+  // attached in it, so the review the pick opens still has it (PostHog PH 118).
+  function handleChangeTemplate(underlag: ReviewUnderlag | null) {
     setQuickReviewOpen(false)
     if (quickReview?.transaction) {
       setTemplatePickerTransaction(quickReview.transaction)
+      setTemplatePickerUnderlag(underlag ? { ...underlag, transactionId: quickReview.transaction.id } : null)
       setTemplatePickerOpen(true)
     }
   }
@@ -4366,7 +4384,10 @@ export default function TransactionsPage() {
               triggerLabel={(() => {
                 const active =
                   sourceItems.find((item) => item.id === effectiveSourceFilter) ?? sourceItems[0]
-                return active.annotation ? `${active.label} · ${active.annotation}` : active.label
+                // The annotation is a balance: a colon, not a middle dot,
+                // which reads as a minus sign in front of an amount on a
+                // small screen (PostHog PH 119).
+                return active.annotation ? `${active.label}: ${active.annotation}` : active.label
               })()}
               items={sourceItems}
             />
@@ -4908,6 +4929,7 @@ export default function TransactionsPage() {
           entityType={entityType as EntityType}
           onConfirm={handleQuickReviewConfirm}
           onChangeTemplate={handleChangeTemplate}
+          carriedUnderlag={quickReview?.underlag ?? null}
           assistantRead={quickReview ? (assistantReadsRef.current[quickReview.transaction.id] ?? null) : null}
           onEditLines={handleEditProposedLines}
         />

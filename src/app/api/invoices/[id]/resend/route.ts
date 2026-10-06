@@ -1,8 +1,6 @@
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
-import { renderToBuffer } from '@react-pdf/renderer'
-import { InvoicePDF } from '@/lib/invoices/pdf-template'
-import { prepareInvoicePdfRender, buildSwishQrDataUrl, buildPaymentLinkQrDataUrl } from '@/lib/invoices/pdf-render-helpers'
+import { renderInvoicePdfBuffer } from '@/lib/invoices/render-invoice-pdf'
 import { getEmailService } from '@/lib/email/service'
 import { resolveInvoiceSender } from '@/lib/email/invoice-sender'
 import {
@@ -18,7 +16,6 @@ import {
   resolveInvoiceEmailRecipients,
   resolveInvoiceReplyTo,
 } from '@/lib/invoices/email-recipients'
-import { invoiceRequiresPaymentAccount } from '@/lib/invoices/payment-accounts'
 import { ensureInitialized } from '@/lib/init'
 import { guardSandbox } from '@/lib/sandbox/guard'
 import { requireCapability } from '@/lib/entitlements/has-capability'
@@ -79,6 +76,9 @@ export const POST = withRouteContext(
       .from('company_settings').select('*').eq('company_id', companyId).single()
     if (!company) return NextResponse.json({ error: 'Företagsinställningar saknas' }, { status: 500 })
 
+    if (!invoice.customer) {
+      return NextResponse.json({ error: 'Fakturan saknar kund' }, { status: 422 })
+    }
     const customer = invoice.customer as Customer
     const toAddress = (parsed.data.to ?? customer.email ?? '').trim()
     if (!toAddress || !EMAIL_PATTERN.test(toAddress)) {
@@ -107,26 +107,13 @@ export const POST = withRouteContext(
     // Render as 'sent' so the copy matches what the customer originally got
     // (no PAID/OVERDUE stamp variations).
     const renderable = { ...(invoice as Invoice), status: 'sent' as const }
-    const { branding, company: renderCompany } = await prepareInvoicePdfRender(
-      company as CompanySettings,
-      renderable.currency,
-      {
-        paymentAccountRequired: invoiceRequiresPaymentAccount(invoice as Invoice),
-        payee: (invoice as Invoice).payment_details ?? null,
-      },
-    )
-    const pdfBuffer = await renderToBuffer(
-      InvoicePDF({
-        invoice: renderable,
-        customer,
-        items,
-        company: renderCompany,
-        originalInvoiceNumber,
-        branding,
-        swishQrDataUrl: await buildSwishQrDataUrl(renderCompany, renderable),
-        paymentLinkQrDataUrl: await buildPaymentLinkQrDataUrl(renderable),
-      }),
-    )
+    const { buffer: pdfBuffer } = await renderInvoicePdfBuffer({
+      invoice: renderable,
+      customer,
+      items,
+      company: company as CompanySettings,
+      originalInvoiceNumber,
+    })
 
     const replyTo = resolveInvoiceReplyTo(company as CompanySettings, user.email)
     const emailData = { invoice: renderable, customer, company: company as CompanySettings, replyTo }

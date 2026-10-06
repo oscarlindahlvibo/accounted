@@ -20,7 +20,7 @@ import { commitArkivProposeFact } from '@/lib/arkiv/facts/propose'
 import { parseEntityType, resolveCompanyEntityType } from '@/lib/company/entity-type'
 import { eventBus } from '@/lib/events'
 import { bulkBookMatchedInboxItems, categorizeMatchedTransaction } from '@/lib/transactions/categorize-core'
-import { explainVatTreatment, getVatRules, getPermittedVatRates } from '@/lib/invoices/vat-rules'
+import { enforceBulkBookDimensionPolicy } from '@/lib/transactions/bulk-book'
 import { syncDraftVatHeadersForCustomer } from '@/lib/invoices/sync-draft-vat-headers'
 import {
   COUNTRY_CONSISTENCY_MESSAGES,
@@ -51,31 +51,35 @@ import {
 import { resolveDefaultPaymentTerms } from '@/lib/customers/default-payment-terms'
 import {
   normalizeVatRateToDecimal,
-  normalizeVatRateToFraction,
   treatmentDeductsInputVat,
 } from '@/lib/vat/supplier-invoice-line-checks'
 import {
   createInvoicePaymentJournalEntry,
   createInvoiceCashEntry,
-  createInvoiceJournalEntry,
   createCreditNoteJournalEntry,
 } from '@/lib/bookkeeping/invoice-entries'
+import {
+  archiveIssuedInvoicePdf,
+  markInvoiceSentAndBook,
+  restoreUnbookedDraft,
+  type IssuableInvoice,
+} from '@/lib/invoices/issue-and-book-invoice'
 import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
-import { buildInvoicePaymentClearingLines } from '@/lib/bookkeeping/invoice-payment-lines'
-import { resolveSekAmount } from '@/lib/bookkeeping/currency-utils'
-import { booksInvoicesOnIssue, cashPartialBlockReason, creditNoteNeedsJournalEntry, supplierCreditNoteNeedsJournalEntry } from '@/lib/bookkeeping/booking-mode'
+import { buildInvoiceMatchClearingLines } from '@/lib/bookkeeping/invoice-payment-lines'
+import { booksInvoicesOnIssue, cashPartialBlockReason, creditNoteNeedsJournalEntry } from '@/lib/bookkeeping/booking-mode'
 import { ensureManualCashAccount } from '@/lib/cash-accounts/service'
-import { propagateLegacyPayeeWrite } from '@/lib/cash-accounts/invoice-payee'
 import { createJournalEntry, findFiscalPeriod, getSwedishLocalDate, reverseEntry, validateBalance } from '@/lib/bookkeeping/engine'
 import {
   canApproveSupplierInvoice,
   resolveUnsettledStatus,
 } from '@/lib/supplier-invoices/lifecycle'
-import { buildSupplierCreditNoteRow } from '@/lib/supplier-invoices/credit-note'
+import { CreditSupplierInvoiceInputSchema, creditSupplierInvoice } from '@/lib/supplier-invoices/credit'
+import { resolveInboxKind } from '@/lib/documents/inbox-kind'
 import { coerceDimensionsBag } from '@/lib/bookkeeping/dimension-resolver'
 import { ACCOUNT_NUMBER_RE } from '@/lib/invariants/account-number'
-import { ISO_DATE_RE } from '@/lib/invariants/iso-date'
 import { isSlpPensionAccount } from '@/lib/bookkeeping/slp-lines'
+import { foldSellerVatIntoCost, sellerVatIsCost } from '@/lib/bookkeeping/vat-registration'
+import { isReverseChargeKind } from '@/lib/bookkeeping/vat-entries'
 import { cancelOrphanedPaymentEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
 import { runWithActor } from '@/lib/bookkeeping/actor-context-node'
 import type { CommitActor } from '@/lib/bookkeeping/actor-context'
@@ -92,6 +96,11 @@ import {
   KontantmetodCutoffPartialError,
   postKontantmetodCutoff,
 } from '@/lib/core/bookkeeping/kontantmetod-cutoff'
+import {
+  isKontantmetodCutoffSuspended,
+  KONTANTMETOD_CUTOFF_SUSPENDED_CODE,
+  kontantmetodCutoffSuspendedMessageSv,
+} from '@/lib/core/bookkeeping/kontantmetod-cutoff-suspension'
 import { executeCurrencyRevaluation } from '@/lib/bookkeeping/currency-revaluation'
 import {
   AssetCorrectionBlockedError,
@@ -109,12 +118,10 @@ import {
   checkCreateAssetGates,
   checkUpdateAssetGates,
 } from '@/lib/bokslut/assets/asset-api'
-import {
-  createSupplierCreditNoteEntry,
-  createSupplierInvoiceRegistrationEntry,
-} from '@/lib/bookkeeping/supplier-invoice-entries'
+import { createSupplierInvoiceRegistrationEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { linkInvoiceToVoucher, type LinkInvoiceToVoucherResult } from '@/lib/invoices/voucher-matching'
 import { planInvoicePayment } from '@/lib/invoices/apply-invoice-payment'
+import { planTransactionInvoiceMatch } from '@/lib/invoices/match-payment-plan'
 import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplicate-payment-candidates'
 import {
   alreadyExplainedDetails,
@@ -130,6 +137,7 @@ import {
   type LinkSupplierInvoiceToVoucherResult,
 } from '@/lib/invoices/supplier-voucher-matching'
 import { clearSettledInvoiceSuggestions } from '@/lib/invoices/clear-settled-invoice-suggestions'
+import { emitInvoicePaidIfSettled } from '@/lib/invoices/paid-events'
 import {
   findCashMethodUnbookedAllocations,
   type BatchAllocationRef,
@@ -141,17 +149,18 @@ import {
   type BatchAllocationResult,
 } from '@/lib/invoices/clear-settled-batch-allocations'
 import { linkTransactionToJournalEntry } from '@/lib/transactions/link-journal-entry'
+import { emitBatchAllocationEvents } from '@/lib/transactions/batch-allocation-events'
 import { matchTransactionToRotRutPayout } from '@/lib/invoices/rot-rut-match-transaction'
 import { linkRotRutPayoutVoucher } from '@/lib/invoices/rot-rut-link-voucher'
-import {
-  completeInboxItemsForBookedTransaction,
-  resolveVoucherLinkedEntryIds,
-} from '@/lib/transactions/inbox-underlag'
+import { attachDocumentToTransaction } from '@/lib/transactions/document-attach'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
+import { invoiceLacksCustomer } from '@/lib/invoices/invoice-customer'
+import { createDimensionValue } from '@/lib/dimensions/registry-service'
 import { submitSIEJob, requestSIEJobAction } from '@/lib/import/sie-jobs'
 import type { AccountMapping } from '@/lib/import/types'
 import { AccountsNotInChartError, isBookkeepingError, ACCOUNTS_NOT_IN_CHART } from '@/lib/bookkeeping/errors'
 import { extensionRegistry } from '@/lib/extensions/registry'
+import { applyPaymentLinkToInvoice } from '@/lib/extensions/payment-links'
 import {
   SkatteverketRecoverableError,
   type SkatteverketCommitServices,
@@ -170,9 +179,7 @@ import {
   generateInvoiceEmailSubject,
 } from '@/lib/email/invoice-templates'
 import { linkToJournalEntry } from '@/lib/core/documents/document-service'
-import { renderToBuffer } from '@react-pdf/renderer'
-import { InvoicePDF } from '@/lib/invoices/pdf-template'
-import { prepareInvoicePdfRender, buildSwishQrDataUrl } from '@/lib/invoices/pdf-render-helpers'
+import { renderInvoicePdfBuffer } from '@/lib/invoices/render-invoice-pdf'
 import { resolveInvoicePayeeChoice, resolveInvoiceSettlementAccount, snapshotInvoicePayee } from '@/lib/invoices/invoice-payee'
 import {
   describeMissingInvoicePaymentAccount,
@@ -200,8 +207,7 @@ import { CreateSupplierParamsSchema } from '@/lib/pending-operations/schemas/cre
 import { CreateArticleParamsSchema, UpdateArticleParamsSchema } from '@/lib/pending-operations/schemas/article'
 import { CreateDimensionValueParamsSchema } from '@/lib/pending-operations/schemas/dimension-value'
 import { RetagLineDimensionsParamsSchema } from '@/lib/pending-operations/schemas/retag-line-dimensions'
-import { CreateAccountParamsSchema, UpdateAccountParamsSchema } from '@/lib/pending-operations/schemas/account'
-import { defaultRateForVatTreatment } from '@/lib/vat/account-vat-treatment'
+import { everyRetagRefused, retagLines } from '@/lib/dimensions/retag-service'
 import { SetVoucherNoteParamsSchema } from '@/lib/pending-operations/schemas/voucher-note'
 import { IgnoreTransactionParamsSchema } from '@/lib/pending-operations/schemas/ignore-transaction'
 import { setTransactionIgnored } from '@/lib/transactions/ignore'
@@ -217,7 +223,6 @@ import { registerSalesOrderDelivery } from '@/lib/sales-orders/register-delivery
 import { createInvoiceFromSalesOrder } from '@/lib/sales-orders/create-invoice-from-order'
 import { convertToSalesOrder } from '@/lib/sales-orders/convert-to-sales-order'
 import type { ServiceFailure } from '@/lib/sales-orders/result'
-import { UpdateCompanySettingsParamsSchema } from '@/lib/pending-operations/schemas/company-settings'
 import { UpdateCustomerParamsSchema } from '@/lib/pending-operations/schemas/customer'
 import {
   CreateRecurringScheduleParamsSchema,
@@ -231,12 +236,12 @@ import {
 } from '@/lib/invoices/recurring-schedule-service'
 import { runDateMatchesDayOfMonth } from '@/lib/invoices/recurring-run-date'
 import { UpdateInvoiceParamsSchema } from '@/lib/pending-operations/schemas/update-invoice'
+import { buildStagedInvoice } from '@/lib/pending-operations/build-staged-invoice'
 import {
   buildInvoiceWriteData,
   type InvoiceWriteInput,
   type InvoiceWriteItemInput,
 } from '@/lib/invoices/build-invoice-write'
-import { computeLineNet } from '@/lib/invoices/line-amounts'
 import { deleteDraftInvoice } from '@/lib/invoices/delete-draft-invoice'
 import { isEditableInvoiceDraft } from '@/lib/invoices/is-editable-draft'
 import { replaceInvoiceItems } from '@/lib/invoices/replace-invoice-items'
@@ -247,6 +252,8 @@ import { BulkBookInboxSchema, OpeningBalancesBulkSchema } from '@/lib/api/schema
 import { ensureArticleNumber } from '@/lib/articles/ensure-article-number'
 import { isValidRevenueAccount } from '@/lib/articles/validate-revenue-account'
 import { z } from 'zod'
+import { operationForPendingType } from '@/lib/operations/registry'
+import type { AnyOperation } from '@/lib/operations/types'
 import type {
   Transaction,
   TransactionCategory,
@@ -334,38 +341,6 @@ export interface CommitOptions {
 // above) so the bulk-book-inbox path and the single-categorize path share one
 // implementation.
 
-async function recordSkippedInvoiceJournalEntry(
-  invoiceId: string,
-  companyId: string,
-  userId: string,
-  operation: 'send_invoice' | 'mark_invoice_sent',
-  err: unknown
-): Promise<void> {
-  try {
-    const reasonCode = err instanceof AccountsNotInChartError
-      ? 'accounts_not_in_chart'
-      : 'journal_entry_error'
-    const accountNumbers = err instanceof AccountsNotInChartError ? err.accountNumbers : undefined
-    await appendProcessingHistory({
-      companyId,
-      correlationId: invoiceId,
-      aggregateType: 'System',
-      aggregateId: invoiceId,
-      eventType: 'InvoiceJournalEntrySkipped',
-      payload: {
-        invoice_id: invoiceId,
-        operation,
-        reason_code: reasonCode,
-        ...(accountNumbers ? { account_numbers: accountNumbers } : {}),
-      },
-      actor: { type: 'user', id: userId },
-      occurredAt: new Date(),
-    })
-  } catch (historyErr) {
-    log.warn('Failed to append InvoiceJournalEntrySkipped to processing_history', historyErr)
-  }
-}
-
 // ── Executors ────────────────────────────────────────────────────
 
 /**
@@ -409,6 +384,68 @@ type ExecutorResult = {
   // the dispatcher then lands the op in 'failed_partial' instead of
   // 'rejected' and persists these ids in result_data.posted_ids (issue #842).
   partialPostedIds?: Record<string, string>
+  // Set when the refusal came before any side-effect and only says another
+  // call holds the resource right now (SALARY_RUN_BOOKING_IN_PROGRESS): the
+  // dispatcher hands the op back to 'pending', exactly as for a 401/403, so
+  // the approval can be given again once the other call is done instead of
+  // the op being consumed as 'rejected'.
+  returnToPending?: boolean
+}
+
+/** A draft without a customer (crm#263): refused before anything changes. */
+function customerMissingResult(): ExecutorResult {
+  const entry = getErrorEntry('INVOICE_CUSTOMER_MISSING')
+  return {
+    error: entry?.message_sv ?? 'Fakturan saknar kund.',
+    errorCode: 'INVOICE_CUSTOMER_MISSING',
+    status: entry?.httpStatus ?? 409,
+  }
+}
+
+/**
+ * Executor for an operation from the registry: re-validates the staged input
+ * at the commit boundary (a tampered pending_operations row must not reach
+ * the books with fields the staging tool never accepted) and runs it for
+ * real. A BookkeepingError is rethrown so the dispatcher's catch handles it
+ * exactly as for a hand-written executor.
+ */
+async function commitRegisteredOperation(
+  operation: AnyOperation,
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>,
+): Promise<ExecutorResult> {
+  const upgrade = operation.mcp?.stage?.upgradeParams
+  const parsed = (operation.input as unknown as z.ZodTypeAny).safeParse(upgrade ? upgrade(params) : params)
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]
+    return {
+      error: `Invalid ${issue?.path?.join('.') || 'params'}: ${issue?.message ?? 'validation failed'}`,
+      errorCode: 'VALIDATION_ERROR',
+      status: 400,
+    }
+  }
+  const outcome = await operation.run(
+    { supabase, companyId, userId, log: log.child({ operation: operation.id }) },
+    parsed.data,
+    { dryRun: false },
+  )
+  if (!outcome.ok) {
+    if (outcome.error) throw outcome.error
+    const entry = getErrorEntry(outcome.code)
+    const partial = outcome.partialPostedIds && Object.keys(outcome.partialPostedIds).length > 0
+    return {
+      // Never an empty string: an empty error reads as success downstream.
+      error: outcome.messageSv || entry?.message_en || outcome.code,
+      errorCode: outcome.code,
+      status: entry?.httpStatus ?? 400,
+      // A failure after an irreversible step: failed_partial, not rejected.
+      ...(partial ? { partialPostedIds: outcome.partialPostedIds } : {}),
+    }
+  }
+  if (outcome.dryRun) return { data: outcome.preview }
+  return { data: outcome.data as Record<string, unknown> }
 }
 
 /**
@@ -586,9 +623,23 @@ async function commitCategorizeTransaction(
     }
   }
 
+  // Same tamper/drift gate for the reverse-charge basis box: the approver saw
+  // the ruta the staged kind puts the basis in, so a present but unknown kind
+  // must not silently fall back to the EU-services default.
+  const rawReverseChargeKind = params.reverse_charge_kind
+  if (rawReverseChargeKind != null && !isReverseChargeKind(rawReverseChargeKind)) {
+    return {
+      error:
+        'Ogiltig reverse_charge_kind i den stagade operationen. ' +
+        'Avvisa operationen och stagea om kategoriseringen.',
+      status: 400,
+    }
+  }
+
   return categorizeMatchedTransaction(supabase, userId, companyId, txId, {
     category,
     vatTreatment,
+    reverseChargeKind: rawReverseChargeKind ?? undefined,
     vatAmount,
     notes,
     allowDuplicate: params.allow_duplicate === true,
@@ -854,70 +905,6 @@ async function commitUpdateCustomer(
       // Never the stored ciphertext, and never plaintext: result_data is
       // persisted on the pending operation and rendered in approval UIs.
       personal_number_masked: maskStoredCustomerPersonalNumber(data.personal_number),
-    },
-  }
-}
-
-async function commitUpdateCompanySettings(
-  supabase: SupabaseClient,
-  companyId: string,
-  params: Record<string, unknown>,
-): Promise<ExecutorResult> {
-  let validated
-  try {
-    validated = UpdateCompanySettingsParamsSchema.parse(params)
-  } catch (err) {
-    if (err instanceof z.ZodError) {
-      const issue = err.issues[0]
-      return {
-        error: `Invalid ${issue?.path?.join('.') ?? 'params'}: ${issue?.message ?? 'validation failed'}`,
-        status: 400,
-      }
-    }
-    throw err
-  }
-
-  // The bank columns mirror the default SEK payee account (migration
-  // 20260904010000): write the change through FIRST so a failure leaves
-  // nothing half-written, and the invoice PDF prints what the agent set.
-  try {
-    await propagateLegacyPayeeWrite(supabase, companyId, validated.changes)
-  } catch (err) {
-    log.error('update_company_settings: payee write-through failed', err as Error)
-    return { error: err instanceof Error ? err.message : 'Payee write-through failed', status: 500 }
-  }
-
-  const { data: row, error } = await supabase
-    .from('company_settings')
-    .update(validated.changes)
-    .eq('company_id', companyId)
-    .select('bank_name, clearing_number, account_number, bankgiro, plusgiro, swish, iban, bic, default_our_reference, email, phone, website, invoice_email_texts')
-    .single()
-
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return { error: 'Company settings not found', status: 404 }
-    }
-    return { error: error.message, status: 500 }
-  }
-
-
-  return {
-    data: {
-      company_id: companyId,
-      bank_name: row.bank_name ?? null,
-      clearing_number: row.clearing_number ?? null,
-      account_number: row.account_number ?? null,
-      bankgiro: row.bankgiro ?? null,
-      plusgiro: row.plusgiro ?? null,
-      swish: row.swish ?? null,
-      iban: row.iban ?? null,
-      bic: row.bic ?? null,
-      contact_person: row.default_our_reference ?? null,
-      email: row.email ?? null,
-      phone: row.phone ?? null,
-      website: row.website ?? null,
-      invoice_email_texts: row.invoice_email_texts ?? null,
     },
   }
 }
@@ -1355,137 +1342,6 @@ async function commitUpdateArticle(
   return { data: { article_id: data.id } }
 }
 
-async function commitCreateAccount(
-  supabase: SupabaseClient,
-  userId: string,
-  companyId: string,
-  params: Record<string, unknown>
-): Promise<ExecutorResult> {
-  // Defense in depth: re-validate the staged params at the commit boundary so
-  // a tampered pending_operations row cannot inject unexpected fields into
-  // chart_of_accounts (ASVS V4.5): mirrors commitCreateArticle.
-  let validated
-  try {
-    validated = CreateAccountParamsSchema.parse(params)
-  } catch (err) {
-    if (err instanceof z.ZodError) {
-      const issue = err.issues[0]
-      return { error: `Invalid ${issue?.path?.join('.') ?? 'params'}: ${issue?.message ?? 'validation failed'}`, status: 400 }
-    }
-    throw err
-  }
-
-  // Same row shape as the dashboard create route
-  // (app/api/bookkeeping/accounts/route.ts): class/group/sort_order derive
-  // from the number so the two write paths cannot drift.
-  const defaultVatRate = validated.default_vat_treatment && validated.default_vat_rate == null
-    ? defaultRateForVatTreatment(
-        validated.default_vat_treatment,
-        Number(validated.account_number[0]),
-      )
-    : validated.default_vat_rate ?? null
-
-  const { data, error } = await supabase
-    .from('chart_of_accounts')
-    .insert({
-      user_id: userId,
-      company_id: companyId,
-      account_number: validated.account_number,
-      account_name: validated.account_name,
-      account_class: parseInt(validated.account_number[0]),
-      account_group: validated.account_number.substring(0, 2),
-      account_type: validated.account_type,
-      normal_balance: validated.normal_balance,
-      plan_type: validated.plan_type,
-      is_active: true,
-      is_system_account: false,
-      description: validated.description ?? null,
-      default_vat_code: validated.default_vat_code ?? null,
-      default_vat_rate: defaultVatRate,
-      default_vat_treatment: validated.default_vat_treatment ?? null,
-      sru_code: validated.sru_code ?? null,
-      sort_order: parseInt(validated.account_number),
-    })
-    .select('account_number, account_name')
-    .single()
-
-  if (error) {
-    if (error.code === '23505') {
-      return { error: `Kontonummer ${validated.account_number} finns redan i kontoplanen.`, status: 409 }
-    }
-    return { error: error.message, status: 500 }
-  }
-
-  return { data: { account_number: data.account_number, account_name: data.account_name } }
-}
-
-async function commitUpdateAccount(
-  supabase: SupabaseClient,
-  _userId: string,
-  companyId: string,
-  params: Record<string, unknown>
-): Promise<ExecutorResult> {
-  let validated
-  try {
-    validated = UpdateAccountParamsSchema.parse(params)
-  } catch (err) {
-    if (err instanceof z.ZodError) {
-      const issue = err.issues[0]
-      return { error: `Invalid ${issue?.path?.join('.') ?? 'params'}: ${issue?.message ?? 'validation failed'}`, status: 400 }
-    }
-    throw err
-  }
-
-  const { account_number, ...rest } = validated
-  const updateData: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(rest)) {
-    if (value !== undefined) updateData[key] = value
-  }
-
-  if (validated.default_vat_treatment && validated.default_vat_rate == null) {
-    const { data: current, error: currentError } = await supabase
-      .from('chart_of_accounts')
-      .select('default_vat_rate')
-      .eq('company_id', companyId)
-      .eq('account_number', account_number)
-      .single()
-
-    if (currentError) {
-      if (currentError.code === 'PGRST116') {
-        return { error: 'Kontot hittades inte', status: 404 }
-      }
-      return { error: currentError.message, status: 500 }
-    }
-
-    if (current.default_vat_rate == null) {
-      updateData.default_vat_rate = defaultRateForVatTreatment(
-        validated.default_vat_treatment,
-        Number(account_number.charAt(0)),
-      )
-    } else {
-      delete updateData.default_vat_rate
-    }
-  }
-  if (Object.keys(updateData).length === 0) {
-    return { error: 'Inget att uppdatera', status: 400 }
-  }
-
-  const { data, error } = await supabase
-    .from('chart_of_accounts')
-    .update(updateData)
-    .eq('company_id', companyId)
-    .eq('account_number', account_number)
-    .select('account_number, account_name, is_active')
-    .single()
-
-  if (error) {
-    if (error.code === 'PGRST116') return { error: 'Kontot hittades inte', status: 404 }
-    return { error: error.message, status: 500 }
-  }
-
-  return { data: { account_number: data.account_number, account_name: data.account_name, is_active: data.is_active } }
-}
-
 async function commitSetVoucherNote(
   supabase: SupabaseClient,
   companyId: string,
@@ -1829,7 +1685,7 @@ async function commitCreateSupplier(
  */
 async function commitCreateDimensionValue(
   supabase: SupabaseClient,
-  _userId: string,
+  userId: string,
   companyId: string,
   params: Record<string, unknown>
 ): Promise<ExecutorResult> {
@@ -1860,9 +1716,12 @@ async function commitCreateDimensionValue(
     }
   }
 
+  // The staged params address the dimension by its SIE number; the create
+  // itself (dates only on an accumulating dimension, the insert, a duplicate
+  // code) is createDimensionValue, the same rules the dashboard and v1 run.
   const { data: dimension, error: dimError } = await supabase
     .from('dimensions')
-    .select('id, sie_dim_no, name, resets_annually')
+    .select('id, sie_dim_no, name')
     .eq('company_id', companyId)
     .eq('sie_dim_no', validated.sie_dim_no)
     .maybeSingle()
@@ -1877,30 +1736,21 @@ async function commitCreateDimensionValue(
     }
   }
 
-  // Value dates only make sense on accumulating dimensions (projekt-style
-  // ranges): mirrors POST /api/dimensions/[id]/values.
-  if (dimension.resets_annually && (validated.start_date || validated.end_date)) {
-    return {
-      error: `Start-/slutdatum är inte tillåtna på dimensionen "${dimension.name}" (nollställs årligen).`,
-      status: 400,
-    }
-  }
-
-  const { data: created, error: insertError } = await supabase
-    .from('dimension_values')
-    .insert({
-      company_id: companyId,
-      dimension_id: dimension.id,
+  const outcome = await createDimensionValue(
+    { supabase, companyId, userId, log: log.child({ operation: 'create_dimension_value' }) },
+    dimension.id,
+    {
       code: validated.code,
       name: validated.name,
-      start_date: validated.start_date ?? null,
-      end_date: validated.end_date ?? null,
-    })
-    .select('id, code, name, is_active')
-    .single()
+      // optString's z.preprocess widens the inferred type; the inner schema
+      // is an ISO date string.
+      start_date: (validated.start_date as string | undefined) ?? null,
+      end_date: (validated.end_date as string | undefined) ?? null,
+    },
+  )
 
-  if (insertError) {
-    if (insertError.code === '23505') {
+  if (!outcome.ok) {
+    if (outcome.code === 'DIMENSION_VALUE_DUPLICATE_CODE') {
       // Duplicate code: treat the existing value as success (idempotency).
       const { data: existing, error: existingError } = await supabase
         .from('dimension_values')
@@ -1910,7 +1760,7 @@ async function commitCreateDimensionValue(
         .eq('code', validated.code)
         .maybeSingle()
       if (existingError || !existing) {
-        return { error: insertError.message, status: 500 }
+        return { error: getErrorEntry(outcome.code)?.message_sv ?? outcome.code, errorCode: outcome.code, status: 500 }
       }
       return {
         data: {
@@ -1924,17 +1774,32 @@ async function commitCreateDimensionValue(
         },
       }
     }
-    return { error: insertError.message, status: 500 }
+    if (outcome.code === 'DIMENSION_VALUE_DATES_NOT_ALLOWED') {
+      return {
+        error: `Start-/slutdatum är inte tillåtna på dimensionen "${dimension.name}" (nollställs årligen).`,
+        errorCode: outcome.code,
+        status: 400,
+      }
+    }
+    const entry = getErrorEntry(outcome.code)
+    const cause = (outcome.error as { message?: unknown } | undefined)?.message
+    return {
+      // Never an empty string: an empty error reads as success downstream.
+      error: outcome.messageSv || (typeof cause === 'string' ? cause : '') || entry?.message_sv || outcome.code,
+      errorCode: outcome.code,
+      status: entry?.httpStatus ?? 500,
+    }
   }
+  if (outcome.dryRun) return { data: outcome.preview }
 
   return {
     data: {
-      dimension_value_id: created.id,
+      dimension_value_id: outcome.data.id,
       sie_dim_no: dimension.sie_dim_no,
       dimension_name: dimension.name,
-      code: created.code,
-      name: created.name,
-      is_active: created.is_active,
+      code: outcome.data.code,
+      name: outcome.data.name,
+      is_active: outcome.data.is_active,
       already_existed: false,
     },
   }
@@ -1954,6 +1819,11 @@ async function commitCreateDimensionValue(
  * retagged: each RPC call is its own transaction. Failures are collected
  * and echoed (capped at 20) so the caller can re-stage just the failed set.
  * Only when EVERY line fails does the operation as a whole fail.
+ *
+ * The loop, the merge of the staged pairs into each line's current bag, and
+ * the all-refused rule live in lib/dimensions/retag-service.ts. A merge
+ * reads the bags at approval, not at staging, so a tag set in between is
+ * kept.
  */
 async function commitRetagLineDimensions(
   supabase: SupabaseClient,
@@ -1976,30 +1846,32 @@ async function commitRetagLineDimensions(
     throw err
   }
 
-  let retagged = 0
-  let unchanged = 0
-  const failed: Array<{ line_id: string; error: string }> = []
+  const outcome = await retagLines(
+    { supabase, companyId, userId, log: log.child({ operation: 'retag_line_dimensions' }) },
+    {
+      line_ids: validated.line_ids,
+      dimensions: validated.dimensions,
+      // A row staged before the mode existed parses as 'replace' (the schema
+      // default): what its approver was shown.
+      mode: validated.mode,
+      reason: validated.reason,
+    },
+  )
+  // Reading the lines for a merge failed: nothing was written.
+  if (!outcome.ok) throw outcome.error ?? new Error(outcome.code)
+  if (outcome.dryRun) return { data: outcome.preview }
 
-  for (const lineId of validated.line_ids) {
-    const { data, error } = await supabase.rpc('retag_line_dimensions', {
-      p_company_id: companyId,
-      p_line_id: lineId,
-      p_dimensions: validated.dimensions,
-      p_reason: validated.reason,
-      p_user_id: userId,
-    })
-    if (error) {
-      failed.push({ line_id: lineId, error: error.message })
-      continue
-    }
-    if ((data as { changed?: boolean } | null)?.changed) retagged++
-    else unchanged++
-  }
-
-  if (failed.length > 0 && retagged === 0 && unchanged === 0) {
+  const { retagged, unchanged, failed } = outcome.data
+  // Echo at most 20 failures: enough to act on without bloating result_data
+  // on a pathological 500-line all-but-one failure.
+  const echoedFailures = failed.slice(0, 20)
+  const refused = everyRetagRefused(outcome.data)
+  if (refused) {
     return {
-      error: `Ingen rad kunde taggas om (${failed.length} rader misslyckades). Första felet: ${failed[0].error}`,
+      error: refused.messageSv,
+      errorCode: 'DIMENSION_RETAG_FAILED',
       status: 400,
+      data: { failed_count: failed.length, failed: echoedFailures },
     }
   }
 
@@ -2008,9 +1880,8 @@ async function commitRetagLineDimensions(
       retagged,
       unchanged,
       failed_count: failed.length,
-      // Echo at most 20 failures: enough to act on without bloating
-      // result_data on a pathological 500-line all-but-one failure.
-      failed: failed.slice(0, 20),
+      failed: echoedFailures,
+      mode: validated.mode,
       dimensions: validated.dimensions,
       ...(validated.filter_summary ? { filter_summary: validated.filter_summary } : {}),
     },
@@ -2147,32 +2018,7 @@ async function commitCreateInvoice(
   companyId: string,
   params: Record<string, unknown>
 ): Promise<ExecutorResult> {
-  const customerId = params.customer_id as string
-  // Offert (quote): own OF-series allocated at insert, never an F-number,
-  // never books, never emits invoice.created. Only 'quote' is honoured here;
-  // anything else stays an ordinary invoice (staged params are caller JSON).
-  const isQuote = params.document_type === 'quote'
-  const validUntil = typeof params.valid_until === 'string' ? params.valid_until : null
-  if (isQuote && (!validUntil || !ISO_DATE_RE.test(validUntil))) {
-    return { error: 'Giltig till (valid_until) krävs för en offert.', status: 400 }
-  }
-  const items = params.items as Array<{
-    description: string; quantity: number; unit: string; unit_price: number; vat_rate?: number
-    discount_percent?: number | null
-    article_id?: string | null; revenue_account?: string | null
-    line_type?: 'product' | 'text'
-    dimensions?: Record<string, string>
-  }>
-  // Dimensions PR7: bags were resolved against the registry at staging time
-  // (resolveDimensionBags in the MCP tool); coerce is the drift/tamper gate.
-  const defaultDimensions = coerceDimensionsBag(params.default_dimensions)
-
-  // Free-text rows carry no amounts and never book. The MCP staging tool
-  // accepts line_type 'text' (normalized to zeroed amounts at staging), and
-  // the totals math must stay identical to app/api/invoices/route.ts, which
-  // excludes text rows from subtotal, VAT, and the mixed-rate detection.
-  const billableItems = items.filter((item) => item.line_type !== 'text')
-
+  const customerId = typeof params.customer_id === 'string' ? params.customer_id : ''
   const { data: customer, error: customerError } = await supabase
     .from('customers').select('*').eq('id', customerId).eq('company_id', companyId).single()
 
@@ -2180,170 +2026,51 @@ async function commitCreateInvoice(
     return { error: 'Customer not found: they may have been deleted.', status: 404 }
   }
 
-  const vatRules = getVatRules(customer.customer_type, customer.vat_number_validated, customer.country)
-  // Gate on the PERMITTED set, not the picker default, exactly like
-  // buildInvoiceWriteData: the ML 6 kap. supplies taxed where they are performed
-  // (hotel/restaurang 12%, persontransport and event admission 6%,
-  // fastighetstjänst and korttidsuthyrning 25%) carry Swedish VAT even to a
-  // foreign business customer. The default is still 0% (vatRules.rate is the
-  // fallback below), so a Swedish rate only lands here when staged explicitly.
-  const permittedRates = getPermittedVatRates(customer.customer_type, customer.vat_number_validated, customer.country)
-  const allowedRates = new Set(permittedRates.map((r) => r.rate))
-
-  // VAT registration gate (mirrors app/api/invoices/route.ts). A
-  // non-momsregistrerad company books no output VAT: force every line to 0%
-  // (momsfri → treatment 'exempt'). 0% is allowed for every customer type, so
-  // the allowedRates guard below still passes.
-  const { data: vatSettings } = await supabase
-    .from('company_settings')
-    .select('vat_registered')
-    .eq('company_id', companyId)
-    .maybeSingle()
-  const notVatRegistered = vatSettings?.vat_registered === false
-  if (notVatRegistered) for (const item of items) item.vat_rate = 0
-
-  // Line totals net of any per-line discount, same math as the web path
-  // (lib/invoices/line-amounts.ts).
-  const subtotal = billableItems.reduce(
-    (sum, item) => sum + computeLineNet(item.quantity, item.unit_price, item.discount_percent),
-    0,
-  )
-
-  let vatAmount = 0
-  for (const item of billableItems) {
-    const itemRate = item.vat_rate !== undefined ? item.vat_rate : vatRules.rate
-    if (!allowedRates.has(itemRate)) {
-      return { error: `Momssats ${itemRate}% är inte tillåten för denna kundtyp`, status: 400 }
-    }
-    // Strict typeof: staged params are JSON a tampered client could shape;
-    // a string would coerce past a bare range check but be ignored by the
-    // number-typed totals math, then land in the NUMERIC column anyway.
-    const discountPercent = item.discount_percent ?? 0
-    if (typeof discountPercent !== 'number' || !(discountPercent >= 0 && discountPercent <= 100)) {
-      return { error: 'Rabatten per rad måste vara mellan 0 och 100 procent', status: 400 }
-    }
-    const lineTotal = computeLineNet(item.quantity, item.unit_price, discountPercent)
-    vatAmount += Math.round(lineTotal * itemRate / 100 * 100) / 100
-  }
-
-  // Why the treatment is what it is (#2749, #2558): echoed on the commit
-  // result so an agent that auto-approved still sees it. The staging tool
-  // put the same list in preview.vat_warnings for the approval card.
-  const vatWarnings = notVatRegistered
-    ? []
-    : explainVatTreatment(
-        customer,
-        billableItems.map((item) => (item.vat_rate !== undefined ? item.vat_rate : vatRules.rate)),
-      )
-
-  // Validate any per-line posting-account override (defense in depth: the legacy field
-  // is frozen onto invoice_items and flows to generatePerRateLines()).
-  const overrideAccounts = Array.from(
-    new Set(billableItems.map((i) => i.revenue_account).filter((a): a is string => !!a)),
-  )
-  for (const acct of overrideAccounts) {
-    if (!(await isValidRevenueAccount(supabase, companyId, acct))) {
-      return { error: `Bokföringskonto ${acct} är inte ett aktivt balans- eller intäktskonto (klass 1-3)`, status: 400 }
-    }
-  }
-
-  // Drift/tamper gate for staged article references: the FK on
-  // invoice_items.article_id only proves the article exists, not that it
-  // belongs to THIS company, so scope-check here like revenue_account above.
-  const stagedArticleIds = Array.from(
-    new Set(items.map((i) => i.article_id).filter((a): a is string => !!a)),
-  )
-  if (stagedArticleIds.length > 0) {
-    const { data: articleRows, error: articleError } = await supabase
-      .from('articles')
-      .select('id')
-      .eq('company_id', companyId)
-      .in('id', stagedArticleIds)
-    if (articleError) return { error: articleError.message, status: 500 }
-    const foundArticleIds = new Set((articleRows ?? []).map((a: { id: string }) => a.id))
-    const missingArticleId = stagedArticleIds.find((a) => !foundArticleIds.has(a))
-    if (missingArticleId) {
-      return { error: `Artikel ${missingArticleId} finns inte i företaget`, status: 400 }
-    }
-  }
-
-  const total = subtotal + vatAmount
-  const currency = ((params.currency as string) || 'SEK') as Currency
-  const invoiceDate = (params.invoice_date as string) || new Date().toISOString().split('T')[0]
-
-  // Sales-side twin of the supplier-invoice currency policy
-  // (lib/currency/supplier-invoice-rate.ts). Three defects lived here:
-  //
-  //  1. `fetchExchangeRate(currency)` passed NO date, so a back-dated invoice
-  //     was translated at TODAY'S kurs. ML 8 kap 21-23 § anchors the
-  //     beskattningsunderlag on the taxable event, and the registration
-  //     verifikat is posted on invoice_date, so the money and the verifikat
-  //     must be anchored on the same day. The staged params carry no
-  //     delivery_date, so invoice_date IS that event here (the web path,
-  //     lib/invoices/build-invoice-write.ts, prefers delivery_date when the
-  //     form supplied one).
-  //  2. No supabase client, so the shared `exchange_rates` cache was neither
-  //     read nor used as the last-cached-observation fallback when Riksbanken
-  //     rate-limits. One transient 429 left the invoice permanently unconverted.
-  //  3. A null result fell through in silence and stored exchange_rate = NULL,
-  //     which resolveSekAmount() then books 1:1: 1000 EUR posts 1000 kr to 3001
-  //     and 250 kr to 2611 instead of 11 500 and 2 875, understating ruta 05
-  //     and ruta 10 by the whole FX difference.
-  let exchangeRate: number | null = null
-  let exchangeRateDate: string | null = null
-  // Multiplier to SEK. 1 for a SEK invoice, so the *_sek columns equal their
-  // invoice-currency counterparts instead of staying NULL: an ordinary Swedish
-  // invoice legitimately has no exchange_rate, and the old
-  // `if (currency !== 'SEK')` guard therefore left total_sek NULL on every one
-  // of them. Same fix, same reason, as supplierInvoiceSekAmounts().
-  let sekRate = 1
-
-  if (currency !== 'SEK') {
-    const rateDate = new Date(invoiceDate)
-    let rateData: Awaited<ReturnType<typeof fetchExchangeRate>> = null
-    if (!Number.isNaN(rateDate.getTime())) {
-      try {
-        rateData = await fetchExchangeRate(currency, rateDate, supabase)
-      } catch {
-        rateData = null
-      }
-    }
-    if (!rateData || !Number.isFinite(rateData.rate) || rateData.rate <= 0) {
-      // Refuse at the approval boundary. Storing NULL only relocates the
-      // failure: createInvoiceJournalEntry() already refuses such an invoice
-      // with INVOICE_FX_RATE_MISSING, by which point the invoice row (and its
-      // F-series number, once sent) exists and the approver has moved on.
+  // The same build the staging preview ran (buildStagedInvoice): the shared
+  // buildInvoiceWriteData with every rule the web and v1 doors apply (VAT
+  // gate, balance-sheet account on a VAT line, ROT/RUT, accrual, articles,
+  // currency), so what the approver saw is what gets written.
+  const staged = await buildStagedInvoice({ supabase, companyId, customer: customer as Customer, params })
+  if (!staged.ok) {
+    if ('validation' in staged) {
+      const issue = staged.validation.issues[0]
       return {
-        error:
-          getErrorEntry('INVOICE_FX_RATE_MISSING')?.message_sv ??
-          'Fakturan är i utländsk valuta men saknar växelkurs. Ange fakturans växelkurs innan den bokförs.',
+        error: `Invalid ${issue?.path?.join('.') || 'params'}: ${issue?.message ?? 'validation failed'}`,
         status: 400,
       }
     }
-    exchangeRate = rateData.rate
-    exchangeRateDate = rateData.date ?? null
-    sekRate = rateData.rate
-  }
-
-  const subtotalSek = roundOre(subtotal * sekRate)
-  const vatAmountSek = roundOre(vatAmount * sekRate)
-  const totalSek = roundOre(total * sekRate)
-
-  const uniqueRates = new Set(billableItems.map((item) => item.vat_rate ?? vatRules.rate))
-  const isMixedRate = uniqueRates.size > 1
-
-  // Validated https-only at staging time (gnubok_create_invoice); re-checked
-  // here so a hand-crafted pending-operation row can't smuggle a non-https
-  // link into customer-facing emails/PDFs. Invalid → dropped, never blocks.
-  const paymentLinkUrl = (() => {
-    const raw = typeof params.payment_link_url === 'string' ? params.payment_link_url.trim() : ''
-    if (!raw || raw.length > 2048) return null
-    try {
-      return new URL(raw).protocol === 'https:' ? raw : null
-    } catch {
-      return null
+    if ('dbError' in staged) {
+      const message = (staged.dbError as { message?: string } | null)?.message
+      return { error: message ?? 'Database error', status: 500 }
     }
-  })()
+    const entry = getErrorEntry(staged.code)
+    return {
+      error: entry?.message_sv ?? staged.code,
+      errorCode: staged.code,
+      status: entry?.httpStatus ?? 400,
+      data: staged.details as Record<string, unknown> | undefined,
+    }
+  }
+  const { isQuote, build } = staged
+  const { invoiceFields } = build
+
+  // Refuse at the approval boundary rather than store exchange_rate NULL:
+  // createInvoiceJournalEntry() refuses such an invoice with
+  // INVOICE_FX_RATE_MISSING anyway, by which point the invoice row (and its
+  // F-series number, once sent) exists and the approver has moved on. A NULL
+  // rate is booked 1:1 otherwise: 1000 EUR to 3001 as 1000 kr, understating
+  // ruta 05 and ruta 10 by the whole FX difference.
+  if (
+    invoiceFields.currency !== 'SEK' &&
+    !(typeof invoiceFields.exchange_rate === 'number' && Number.isFinite(invoiceFields.exchange_rate) && invoiceFields.exchange_rate > 0)
+  ) {
+    return {
+      error:
+        getErrorEntry('INVOICE_FX_RATE_MISSING')?.message_sv ??
+        'Fakturan är i utländsk valuta men saknar växelkurs. Ange fakturans växelkurs innan den bokförs.',
+      status: 400,
+    }
+  }
 
   // Quotes are numbered at insert from their own OF-series (see
   // generate_quote_number); ensureInvoiceNumber must never run on one.
@@ -2369,8 +2096,8 @@ async function commitCreateInvoice(
   const payeeChoice = await resolveInvoicePayeeChoice(
     supabase,
     companyId,
-    currency as Currency,
-    typeof params.payment_cash_account_id === 'string' ? params.payment_cash_account_id : null,
+    invoiceFields.currency,
+    staged.params.payment_cash_account_id ?? null,
   )
   if (!payeeChoice.ok) {
     const entry = getErrorEntry(payeeChoice.code)
@@ -2382,43 +2109,16 @@ async function commitCreateInvoice(
     .insert({
       user_id: userId,
       company_id: companyId,
-      customer_id: customerId,
       invoice_number: quoteNumber,
-      invoice_date: invoiceDate,
-      // A quote has no payment due date: due_date mirrors valid_until
-      // (build-invoice-write parity).
-      due_date: isQuote ? validUntil : (params.due_date as string) || null,
+      ...invoiceFields,
+      // This door has always stored the SEK twins rounded to whole öre.
+      subtotal_sek: invoiceFields.subtotal_sek === null ? null : roundOre(invoiceFields.subtotal_sek),
+      vat_amount_sek: invoiceFields.vat_amount_sek === null ? null : roundOre(invoiceFields.vat_amount_sek),
+      total_sek: invoiceFields.total_sek === null ? null : roundOre(invoiceFields.total_sek),
       // Explicit keys, not a conditional spread: the phantom-column guard
-      // only reads literal payloads. NULLs on non-quotes satisfy the pairing CHECK.
-      document_type: isQuote ? 'quote' : 'invoice',
-      valid_until: isQuote ? validUntil : null,
+      // only reads literal payloads. NULL on non-quotes satisfies the pairing CHECK.
       quote_status: isQuote ? 'open' : null,
-      currency,
-      exchange_rate: exchangeRate,
-      exchange_rate_date: exchangeRateDate,
-      subtotal,
-      subtotal_sek: subtotalSek,
-      vat_amount: vatAmount,
-      vat_amount_sek: vatAmountSek,
-      total,
-      total_sek: totalSek,
-      // A quote is an offer, not a claim: nothing is owed on it (parity with
-      // build-invoice-write). Otherwise a fresh unpaid receivable:
-      // remaining_amount is what every payment
-      // surface reads as the open balance; leaving the NOT NULL DEFAULT 0
-      // made every agent-created invoice look settled.
-      remaining_amount: isQuote ? 0 : total,
       paid_amount: 0,
-      vat_treatment: notVatRegistered ? 'exempt' : vatRules.treatment,
-      vat_rate: isMixedRate ? null : (uniqueRates.values().next().value ?? vatRules.rate),
-      moms_ruta: notVatRegistered ? null : vatRules.momsRuta,
-      reverse_charge_text: notVatRegistered ? null : (vatRules.reverseChargeText || null),
-      our_reference: (params.our_reference as string) || null,
-      your_reference: (params.your_reference as string) || null,
-      invoice_marking: (params.invoice_marking as string) || null,
-      notes: (params.notes as string) || null,
-      payment_link_url: paymentLinkUrl,
-      default_dimensions: defaultDimensions ?? {},
       payment_cash_account_id: payeeChoice.fields.payment_cash_account_id,
       payment_details: payeeChoice.fields.payment_details,
     })
@@ -2427,53 +2127,9 @@ async function commitCreateInvoice(
 
   if (invoiceError) return { error: invoiceError.message, status: 500 }
 
-  const invoiceItems = items.map((item, index) => {
-    // Text rows store the description only and zero everything else. Keys must
-    // match the product branch exactly: PostgREST rejects a bulk insert whose
-    // objects have differing key sets.
-    if (item.line_type === 'text') {
-      return {
-        invoice_id: invoice.id,
-        sort_order: index,
-        line_type: 'text',
-        description: item.description ?? '',
-        quantity: 0,
-        unit: '',
-        unit_price: 0,
-        discount_percent: 0,
-        line_total: 0,
-        vat_rate: 0,
-        vat_amount: 0,
-        article_id: null,
-        revenue_account: null,
-        dimensions: {},
-      }
-    }
-    const itemRate = item.vat_rate !== undefined ? item.vat_rate : vatRules.rate
-    const discountPercent = item.discount_percent ?? 0
-    const lineTotal = computeLineNet(item.quantity, item.unit_price, discountPercent)
-    const itemVat = Math.round(lineTotal * itemRate / 100 * 100) / 100
-    return {
-      invoice_id: invoice.id,
-      sort_order: index,
-      line_type: 'product',
-      description: item.description,
-      quantity: item.quantity,
-      unit: item.unit,
-      unit_price: item.unit_price,
-      discount_percent: discountPercent,
-      line_total: lineTotal,
-      vat_rate: itemRate,
-      vat_amount: itemVat,
-      // Frozen per-line override so generatePerRateLines() books to the article's
-      // account; null falls back to the VAT-treatment-derived account.
-      article_id: item.article_id ?? null,
-      revenue_account: item.revenue_account ?? null,
-      dimensions: coerceDimensionsBag(item.dimensions) ?? {},
-    }
-  })
-
-  const { error: itemsError } = await supabase.from('invoice_items').insert(invoiceItems)
+  const { error: itemsError } = await supabase
+    .from('invoice_items')
+    .insert(build.items.map((row) => ({ ...row, invoice_id: invoice.id })))
 
   if (itemsError) {
     await supabase.from('invoices').delete().eq('id', invoice.id)
@@ -2501,7 +2157,9 @@ async function commitCreateInvoice(
     data: {
       invoice_id: invoice.id,
       invoice_number: invoice.invoice_number ?? quoteNumber,
-      ...(vatWarnings.length > 0 ? { vat_warnings: vatWarnings } : {}),
+      // Why the treatment is what it is (#2749, #2558): echoed so an agent
+      // that auto-approved still sees what preview.vat_warnings said.
+      ...(build.warnings.length > 0 ? { vat_warnings: build.warnings } : {}),
     },
   }
 }
@@ -2549,7 +2207,7 @@ async function commitUpdateInvoice(
   const { data: existing, error: fetchError } = await supabase
     .from('invoices')
     .select(
-      'id, status, invoice_number, journal_entry_id, is_self_billed, credited_invoice_id, quote_status, customer_id, document_type, invoice_date, due_date, delivery_date, currency, your_reference, our_reference, invoice_marking, notes, payment_link_url, payment_link_auto, ore_rounding, default_dimensions, deduction_personnummer_encrypted, deduction_personnummer_last4',
+      'id, status, invoice_number, journal_entry_id, is_self_billed, credited_invoice_id, quote_status, customer_id, document_type, invoice_date, due_date, delivery_date, currency, your_reference, our_reference, invoice_marking, notes, payment_link_url, payment_link_auto, ore_rounding, default_dimensions, deduction_personnummer_encrypted, deduction_personnummer_last4, vat_treatment_override, delivery_country',
     )
     .eq('id', invoiceId)
     .eq('company_id', companyId)
@@ -2578,10 +2236,10 @@ async function commitUpdateInvoice(
     return { error: 'Customer not found: they may have been deleted.', status: 404 }
   }
 
-  // Drift/tamper gate for staged article references, same as
-  // commitCreateInvoice: the FK on invoice_items.article_id proves the article
-  // exists, not that it belongs to THIS company, and the top-level arg guard
-  // never sees a nested items[].article_id.
+  // Drift/tamper gate for staged article references: the FK on
+  // invoice_items.article_id proves the article exists, not that it belongs
+  // to THIS company, and the top-level arg guard never sees a nested
+  // items[].article_id.
   if (changes.items) {
     const stagedArticleIds = Array.from(
       new Set(changes.items.map((item) => item.article_id).filter((a): a is string => !!a)),
@@ -2642,6 +2300,8 @@ async function commitUpdateInvoice(
     payment_link_url: existing.payment_link_url ?? undefined,
     payment_link_auto: existing.payment_link_auto ?? undefined,
     ore_rounding: existing.ore_rounding ?? undefined,
+    // Omitted = the builder leaves the column alone; null clears it.
+    qr_mode: changes.qr_mode,
     deduction_housing_designation: firstDeduction?.housing_designation ?? undefined,
     deduction_apartment_number: firstDeduction?.apartment_number ?? undefined,
     deduction_brf_org_number: firstDeduction?.brf_org_number ?? undefined,
@@ -2665,6 +2325,12 @@ async function commitUpdateInvoice(
           last4: existing.deduction_personnummer_last4 ?? null,
         }
       : null,
+    // A draft that stated its own VAT treatment (#2906) keeps it: this
+    // operation does not carry the fields.
+    existingVatOverride: {
+      vat_treatment: existing.vat_treatment_override ?? null,
+      delivery_country: existing.delivery_country ?? null,
+    },
   })
   if (!build.ok) {
     if ('dbError' in build) {
@@ -3035,29 +2701,23 @@ async function commitMarkInvoicePaid(
   }
 
   // Notify subscribers: invoice.paid fans out to registered webhooks
-  // (lib/webhooks/handler.ts). Best-effort: the payment is already committed,
-  // so an emit failure must not fail the operation. Parity with the v1 and
-  // dashboard mark-paid routes, which previously emitted while this path did not.
-  try {
-    await eventBus.emit({
-      type: 'invoice.paid',
-      payload: {
-        invoice: {
-          ...(invoice as Invoice),
-          status: newStatus,
-          paid_amount: newPaidAmount,
-          remaining_amount: newRemaining,
-          paid_at: paidAt ?? (invoice as Invoice).paid_at,
-        } as Invoice,
-        companyId,
-        userId,
-        paymentAmount,
-        paymentDate,
-      },
-    })
-  } catch (err) {
-    log.warn('invoice.paid emit failed', err)
-  }
+  // (lib/webhooks/handler.ts) once, when this payment settles the invoice in
+  // full. Best-effort: the payment is already committed, so an emit failure
+  // never fails the operation (the helper logs it).
+  await emitInvoicePaidIfSettled({
+    newStatus,
+    invoice: {
+      ...(invoice as Invoice),
+      status: newStatus,
+      paid_amount: newPaidAmount,
+      remaining_amount: newRemaining,
+      paid_at: paidAt ?? (invoice as Invoice).paid_at,
+    } as Invoice,
+    companyId,
+    userId,
+    paymentAmount,
+    paymentDate,
+  })
 
   return { data: { status: newStatus, remaining_amount: newRemaining, journal_entry_id: journalEntryId } }
 }
@@ -3108,6 +2768,8 @@ async function commitSendInvoice(
     }
   }
 
+  // The customer was deleted while the draft pointed at it (crm#263).
+  if (invoiceLacksCustomer(invoice)) return customerMissingResult()
   const customer = invoice.customer as Customer
   if (!customer.email?.trim()) return { error: 'Customer has no email address', status: 400 }
 
@@ -3178,21 +2840,14 @@ async function commitSendInvoice(
   const isFreshAllocation = !invoice.invoice_number
   if (isFreshAllocation) {
     try {
-      const preflight = await prepareInvoicePdfRender(
-        company as CompanySettings,
-        (invoice as Invoice).currency,
-        { paymentAccountRequired, payee: (invoice as Invoice).payment_details ?? null },
-      )
-      await renderToBuffer(
-        InvoicePDF({
-          invoice: { ...(invoice as Invoice), invoice_number: 'F-PREVIEW' },
-          customer,
-          items,
-          company: preflight.company,
-          originalInvoiceNumber,
-          branding: preflight.branding,
-        })
-      )
+      await renderInvoicePdfBuffer({
+        invoice: { ...(invoice as Invoice), invoice_number: 'F-PREVIEW' },
+        customer,
+        items,
+        company: company as CompanySettings,
+        originalInvoiceNumber,
+        paymentAccountRequired,
+      })
     } catch (err) {
       log.error('preflight PDF render failed before invoice number assignment (agent send)', err as Error, {
         companyId,
@@ -3231,27 +2886,34 @@ async function commitSendInvoice(
     return { error: `Failed to assign invoice number: ${err instanceof Error ? err.message : 'unknown'}`, status: 500 }
   }
 
+  // Auto-create an online payment link (extension-provided, e.g. Stripe) now
+  // that the number exists, so the email button and PDF QR carry it: the same
+  // shared step the dashboard send, the v1 send and the recurring auto-send
+  // run. A failure never blocks the send: the faktura is legally valid
+  // without a link, so it degrades to a warning, as on the dashboard.
+  const { failure: paymentLinkFailure } = await applyPaymentLinkToInvoice(
+    supabase,
+    companyId,
+    userId,
+    invoice as Invoice,
+    log,
+  )
+  if (paymentLinkFailure) {
+    log.warn('payment link creation failed on agent send', { invoiceId, reason: paymentLinkFailure })
+  }
+
   // Override `status` to 'sent' on the in-memory copy. The DB flip happens
-  // after email delivery (line ~625); rendering with the stale 'draft' status
-  // would stamp the customer's PDF with "UTKAST".
+  // when the invoice is issued, right before the email; rendering with the
+  // stale 'draft' status would stamp the customer's PDF with "UTKAST".
   const renderableInvoice = { ...(invoice as Invoice), status: 'sent' as const }
-  const { branding, company: renderCompany } = await prepareInvoicePdfRender(
-    company as CompanySettings,
-    renderableInvoice.currency,
-    { paymentAccountRequired, payee: (invoice as Invoice).payment_details ?? null },
-  )
-  const swishQrDataUrl = await buildSwishQrDataUrl(renderCompany, renderableInvoice)
-  const pdfBuffer = await renderToBuffer(
-    InvoicePDF({
-      invoice: renderableInvoice,
-      customer,
-      items,
-      company: renderCompany,
-      originalInvoiceNumber,
-      branding,
-      swishQrDataUrl,
-    })
-  )
+  const { buffer: pdfBuffer } = await renderInvoicePdfBuffer({
+    invoice: renderableInvoice,
+    customer,
+    items,
+    company: company as CompanySettings,
+    originalInvoiceNumber,
+    paymentAccountRequired,
+  })
 
   const isCreditNote = !!invoice.credited_invoice_id
   const filename = invoicePdfFilename({
@@ -3263,6 +2925,67 @@ async function commitSendInvoice(
     documentType: invoice.document_type,
     isCreditNote,
   })
+
+  // Issue BEFORE delivery, fail closed: status sent + the verifikat through
+  // the one issue step the dashboard send, mark-sent and the recurring
+  // auto-send share. A refused verifikat (a required dimension, an archived
+  // dimension value, a locked period) leaves the invoice in draft and sends
+  // nothing; the compare-and-set stops a concurrent issuer before it emails.
+  const issued = await markInvoiceSentAndBook({
+    supabase,
+    companyId,
+    userId,
+    invoice: invoice as IssuableInvoice,
+    settings: company as CompanySettings,
+    log,
+  })
+  if (!issued.ok) {
+    if (issued.errorCode === 'INVOICE_MARK_SENT_RACE') {
+      return { error: 'Invoice has already been sent', status: 409 }
+    }
+    // The engine's own refusal: the dispatcher maps it with its Swedish text.
+    if (isBookkeepingError(issued.bookingError)) throw issued.bookingError
+    return {
+      error: issued.reason ?? getErrorEntry(issued.errorCode)?.message_sv ?? 'Fakturan kunde inte bokföras.',
+      errorCode: issued.errorCode,
+      status: getErrorEntry(issued.errorCode)?.httpStatus ?? 500,
+    }
+  }
+  const journalEntryId = issued.journalEntryId
+  const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
+
+  // The email did not go out after the invoice was issued. With nothing
+  // booked nothing irreversible happened: the draft is restored and the old
+  // error returned. A posted verifikat is never undone: the invoice stays
+  // issued, finished like mark-sent (PDF archived as underlag), and the op
+  // lands in failed_partial carrying the verifikat id.
+  const issuedButNotDelivered = async (whenNothingBooked: ExecutorResult): Promise<ExecutorResult> => {
+    if (!journalEntryId && (await restoreUnbookedDraft(supabase, companyId, invoiceId, log))) {
+      return whenNothingBooked
+    }
+    if (isRealInvoice) {
+      await archiveIssuedInvoicePdf({
+        supabase,
+        companyId,
+        userId,
+        invoice: invoice as IssuableInvoice,
+        settings: company as CompanySettings,
+        journalEntryId,
+        log,
+      })
+    }
+    await eventBus.emit({
+      type: 'invoice.sent',
+      payload: { invoice: { ...(invoice as Invoice), status: 'sent' }, userId, companyId },
+    })
+    const entry = getErrorEntry('INVOICE_SEND_ISSUED_NOT_DELIVERED')
+    return {
+      error: entry?.message_sv ?? 'Fakturan är utfärdad men e-postmeddelandet kunde inte skickas.',
+      errorCode: 'INVOICE_SEND_ISSUED_NOT_DELIVERED',
+      status: entry?.httpStatus ?? 502,
+      ...(journalEntryId ? { partialPostedIds: { journal_entry_id: journalEntryId } } : {}),
+    }
+  }
 
   const replyTo = resolveInvoiceReplyTo(company as CompanySettings, userEmail)
   const emailData = { invoice: renderableInvoice, customer, company: company as CompanySettings, replyTo }
@@ -3296,7 +3019,10 @@ async function commitSendInvoice(
       userId,
       invoiceId,
     })
-    return { error: 'Utskicksinformationen kunde inte sparas. Ingen e-post skickades.', status: 500 }
+    return issuedButNotDelivered({
+      error: 'Utskicksinformationen kunde inte sparas. Ingen e-post skickades.',
+      status: 500,
+    })
   }
 
   if (result.trackingWarning) {
@@ -3309,42 +3035,33 @@ async function commitSendInvoice(
     })
   }
 
-  if (!result.success) return { error: `Failed to send email: ${result.error}`, status: 500 }
-
-  await supabase.from('invoices').update({ status: 'sent' }).eq('id', invoiceId).eq('company_id', companyId)
-
-  const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
-  let createdJournalEntryId: string | undefined
-  // #967: kontantmetoden and defer_invoice_booking companies send WITHOUT
-  // booking; the verifikat comes at payment or via the explicit Bokför step.
-  if (isRealInvoice && booksInvoicesOnIssue(company)) {
-    try {
-      const je = await createInvoiceJournalEntry(
-        supabase, companyId, userId, invoice as Invoice, (company as CompanySettings).entity_type
-      )
-      if (je) {
-        createdJournalEntryId = je.id
-        await supabase.from('invoices').update({ journal_entry_id: je.id }).eq('id', invoiceId)
-      }
-    } catch (err) {
-      await recordSkippedInvoiceJournalEntry(invoiceId, companyId, userId, 'send_invoice', err)
-    }
+  if (!result.success) {
+    return issuedButNotDelivered({ error: `Failed to send email: ${result.error}`, status: 500 })
   }
 
-  if (isRealInvoice && createdJournalEntryId) {
+  if (isRealInvoice && journalEntryId) {
     try {
-      await linkToJournalEntry(supabase, companyId, result.documentId, createdJournalEntryId)
+      await linkToJournalEntry(supabase, companyId, result.documentId, journalEntryId)
     } catch { /* non-blocking */ }
   }
 
-  await eventBus.emit({ type: 'invoice.sent', payload: { invoice: invoice as Invoice, userId, companyId } })
+  await eventBus.emit({
+    type: 'invoice.sent',
+    payload: { invoice: { ...(invoice as Invoice), status: 'sent' }, userId, companyId },
+  })
 
+  const warnings = [
+    // The raw provider/DB reason is logged above; the agent-facing text stays Swedish.
+    ...(paymentLinkFailure
+      ? ['Betalningslänken kunde inte skapas. Fakturan skickades utan betalningslänk.']
+      : []),
+    ...(result.trackingWarning ? ['Delivery history requires reconciliation.'] : []),
+    ...issued.partialFailures.map((failure) => failure.reason),
+  ]
   return {
     data: {
       message: `Invoice ${invoice.invoice_number} sent to ${customer.email}`,
-      ...(result.trackingWarning
-        ? { warning: 'Delivery history requires reconciliation.' }
-        : {}),
+      ...(warnings.length > 0 ? { warning: warnings.join(' ') } : {}),
     },
   }
 }
@@ -3372,6 +3089,8 @@ async function commitMarkInvoiceSent(
     }
   }
   if (invoice.status !== 'draft') return { error: 'Only draft invoices can be marked as sent', status: 409 }
+  // Before the number below is taken (crm#263): the draft stays deletable.
+  if (invoiceLacksCustomer(invoice)) return customerMissingResult()
 
   const { data: settings, error: settingsError } = await supabase
     .from('company_settings')
@@ -3411,10 +3130,33 @@ async function commitMarkInvoiceSent(
     return { error: `Failed to assign invoice number: ${err instanceof Error ? err.message : 'unknown'}`, status: 500 }
   }
 
-  const { error: updateError } = await supabase
-    .from('invoices').update({ status: 'sent' }).eq('id', invoiceId).eq('company_id', companyId)
-
-  if (updateError) return { error: 'Failed to update invoice status', status: 500 }
+  // Issue: status sent + the verifikat, fail closed. The same step the
+  // dashboard mark-sent runs (issueAndBookInvoice): a refused verifikat (a
+  // required dimension, an archived dimension value, a locked period) leaves
+  // the invoice in draft instead of marking it sent without its verifikat.
+  const issued = await markInvoiceSentAndBook({
+    supabase,
+    companyId,
+    userId,
+    invoice: invoice as IssuableInvoice,
+    settings: settings as CompanySettings,
+    log,
+  })
+  if (!issued.ok) {
+    if (issued.errorCode === 'INVOICE_MARK_SENT_RACE') {
+      return { error: 'Only draft invoices can be marked as sent', status: 409 }
+    }
+    if (issued.errorCode === 'INVOICE_MARK_SENT_STATUS_FAILED') {
+      return { error: 'Failed to update invoice status', status: 500 }
+    }
+    // The engine's own refusal: the dispatcher maps it with its Swedish text.
+    if (isBookkeepingError(issued.bookingError)) throw issued.bookingError
+    return {
+      error: issued.reason ?? getErrorEntry(issued.errorCode)?.message_sv ?? 'Fakturan kunde inte bokföras.',
+      errorCode: issued.errorCode,
+      status: getErrorEntry(issued.errorCode)?.httpStatus ?? 500,
+    }
+  }
 
   let deliveryHistoryWarning: string | undefined
   try {
@@ -3428,31 +3170,15 @@ async function commitMarkInvoiceSent(
     deliveryHistoryWarning = 'Fakturan markerades som skickad men utskickshistoriken kunde inte sparas.'
   }
 
-  const isRealInvoice = !invoice.document_type || invoice.document_type === 'invoice'
-  let journalEntryId: string | null = null
-
-  // #967: same gate as the dashboard mark-sent path (issue-and-book-invoice.ts).
-  if (isRealInvoice && booksInvoicesOnIssue(settings)) {
-    try {
-      const je = await createInvoiceJournalEntry(
-        supabase, companyId, userId, invoice as Invoice,
-        await resolveCompanyEntityType(supabase, companyId, settings?.entity_type),
-        invoice.customer?.name
-      )
-      if (je) {
-        journalEntryId = je.id
-        await supabase.from('invoices').update({ journal_entry_id: je.id }).eq('id', invoiceId)
-      }
-    } catch (err) {
-      await recordSkippedInvoiceJournalEntry(invoiceId, companyId, userId, 'mark_invoice_sent', err)
-    }
-  }
-
+  const warnings = [
+    ...(deliveryHistoryWarning ? [deliveryHistoryWarning] : []),
+    ...issued.partialFailures.map((failure) => failure.reason),
+  ]
   return {
     data: {
       status: 'sent',
-      journal_entry_id: journalEntryId,
-      ...(deliveryHistoryWarning ? { warning: deliveryHistoryWarning } : {}),
+      journal_entry_id: issued.journalEntryId,
+      ...(warnings.length > 0 ? { warning: warnings.join(' ') } : {}),
     },
   }
 }
@@ -3539,85 +3265,28 @@ async function commitMatchTransactionInvoice(
     }
   }
 
-  // FX resolution: parity with the dashboard and v1 match routes. paidAmount
-  // MUST be denominated in the INVOICE's currency (the unit of
-  // invoices.paid_amount / remaining_amount and invoice_payments.amount).
-  // This path previously fed the raw bank amount straight in, which (a)
-  // rejected exact whole-krona settlements of öre-carrying invoices and (b)
-  // would corrupt the column units on a cross-currency match.
-  const txIsForeign = !!transaction.currency && transaction.currency !== 'SEK'
-  if (
-    txIsForeign &&
-    transaction.amount_sek == null &&
-    !(transaction.exchange_rate != null && transaction.exchange_rate > 0)
-  ) {
-    return {
-      error:
-        getErrorEntry('MATCH_INVOICE_TX_FX_RATE_MISSING')?.message_sv ??
-        'Transaktionen saknar valutakurs och SEK-belopp.',
-      status: 400,
-    }
-  }
-  const txAbsSek =
-    Math.round(
-      resolveSekAmount(
-        Math.abs(transaction.amount),
-        transaction.amount_sek != null ? Math.abs(transaction.amount_sek) : null,
-        transaction.currency,
-        transaction.exchange_rate,
-      ) * 100,
-    ) / 100
-
-  let fx: { required: false } | { required: true; rate: number; paidInInvoiceCurrency: number } = {
-    required: false,
-  }
-  if (transaction.currency !== invoice.currency) {
-    let rate: number | null = null
-    try {
-      const rateInfo = await fetchExchangeRate(
-        invoice.currency as Currency,
-        new Date(transaction.date),
-        supabase,
-      )
-      if (rateInfo && rateInfo.rate > 0) rate = rateInfo.rate
-    } catch {
-      rate = null
-    }
-    if (rate == null) {
-      return {
-        error:
-          getErrorEntry('MATCH_INVOICE_FX_RATE_UNAVAILABLE')?.message_sv ??
-          'Ingen valutakurs tillgänglig för betalningsdatumet.',
-        status: 400,
-      }
-    }
-    fx = {
-      required: true,
-      rate,
-      paidInInvoiceCurrency: Math.round((txAbsSek / rate) * 10000) / 10000,
-    }
-  }
-  const paidAmount = fx.required ? fx.paidInInvoiceCurrency : transaction.amount
-
-  // Overshoot guard + paid/remaining math: shared with the dashboard and v1
-  // routes via planInvoicePayment. This agent/MCP path previously had NO guard,
-  // so a 1500 payment on a 1000 invoice was silently accepted (paid_amount >
-  // total, AR over-credited). Pure-SEK settlements absorb sub-krona
-  // öresavrundning (booked to 3740 by buildInvoicePaymentClearingLines) so a
-  // whole-krona payment settles in full, exactly as on the other two routes.
+  // FX resolution (paidAmount in the INVOICE's currency) + overshoot guard +
+  // paid/remaining math, through the one helper the staging tools run too, so
+  // a match refused here is refused when it is staged (crm#253). This agent
+  // path previously had NO overshoot guard, so a 1500 payment on a 1000
+  // invoice was silently accepted (paid_amount > total, AR over-credited).
   // Runs BEFORE the storno + JE below, so a rejected match leaves the
   // transaction untouched and never burns a voucher number.
-  const pureSek = transaction.currency === 'SEK' && invoice.currency === 'SEK'
-  const payment = planInvoicePayment(invoice, paidAmount, { absorbOreRounding: pureSek })
-  if (!payment.ok) {
+  const matchPlan = await planTransactionInvoiceMatch(supabase, transaction, invoice)
+  if (!matchPlan.ok) {
     return {
-      error:
-        getErrorEntry('MATCH_AMOUNT_EXCEEDS_REMAINING')?.message_sv ??
-        'Transaktionsbeloppet är större än fakturans återstående belopp.',
+      error: getErrorEntry(matchPlan.code)?.message_sv ?? matchPlan.code,
+      errorCode: matchPlan.code,
       status: 400,
+      // The amounts the stage-time refusal names, so an op staged before that
+      // guard (or whose invoice changed since) is just as actionable here.
+      ...(matchPlan.code === 'MATCH_AMOUNT_EXCEEDS_REMAINING'
+        ? { data: { currency: matchPlan.currency, ...matchPlan.details } }
+        : {}),
     }
   }
-  const { newPaidAmount, newRemaining, isFullyPaid, newStatus } = payment.plan
+  const { fx } = matchPlan
+  const { newPaidAmount, newRemaining, isFullyPaid, newStatus } = matchPlan.plan
   const paidAt = isFullyPaid ? paidAtFromDate(transaction.date) : null
 
   // Read-only prevalidation, deliberately hoisted ABOVE the irreversible
@@ -3659,6 +3328,19 @@ async function commitMatchTransactionInvoice(
   // transaction settled into. Mirrors the match-invoice route fix.
   const paymentAccount = await resolveSettlementAccount(supabase, companyId, transaction.cash_account_id, log)
 
+  // A payment date outside an open period leaves the entry builders below with
+  // nothing to book, and the invoice used to be marked paid with no verifikat.
+  // Refuse here, before the irreversible storno, as the match routes do.
+  const fiscalPeriodId = await findFiscalPeriod(supabase, companyId, transaction.date)
+  if (!fiscalPeriodId) {
+    return {
+      error:
+        getErrorEntry('INVOICE_PAID_NO_FISCAL_PERIOD')?.message_sv ??
+        'Ingen öppen räkenskapsperiod för betalningsdatumet.',
+      status: 400,
+    }
+  }
+
   // From here on the executor posts irreversible vouchers. Track their ids so
   // a later failure can land the op in 'failed_partial' carrying them
   // (issue #842) instead of a clean-looking 'rejected'.
@@ -3686,54 +3368,39 @@ async function commitMatchTransactionInvoice(
       // 3740 öresavrundning line on pure SEK) making the verifikat balance.
       // The old createInvoicePaymentJournalEntry(paidAmount) shape could not
       // carry either residual, so öre-settled and cross-currency matches
-      // left 1510 unclean. Failure semantics preserved: no fiscal period
-      // still soft-fails to journalEntryId = null like the old builder did.
-      const fiscalPeriodId = await findFiscalPeriod(supabase, companyId, transaction.date)
-      if (!fiscalPeriodId) {
-        log.warn('No open fiscal period found for payment date:', transaction.date)
-      } else {
-        const desc = invoice.customer?.name
-          ? `Inbetalning kundfaktura ${invoice.invoice_number}, ${invoice.customer.name}`
-          : `Inbetalning kundfaktura ${invoice.invoice_number}`
-        const { lines: clearingLines } = buildInvoicePaymentClearingLines(
-          {
-            amount: transaction.amount,
-            amount_sek: transaction.amount_sek ?? null,
-            currency: transaction.currency,
-            exchange_rate: transaction.exchange_rate ?? null,
-          },
-          {
-            currency: invoice.currency,
-            exchange_rate: invoice.exchange_rate ?? null,
-            remaining_amount: invoice.remaining_amount ?? null,
-            total: invoice.total,
-            paid_amount: invoice.paid_amount ?? null,
-          },
-          desc,
-          fx.required ? fx.paidInInvoiceCurrency : undefined,
-          paymentAccount,
-        )
-        // Re-propagate the invoice's default dimension bag onto every leg,
-        // including the FX result lines, so a project's kursvinst/kursförlust
-        // stays inside the project P&L: the shared line-builder is
-        // dimension-agnostic.
-        const defaultDimensions = coerceDimensionsBag(
-          (invoice as { default_dimensions?: unknown }).default_dimensions,
-        )
-        if (defaultDimensions) {
-          for (const line of clearingLines) line.dimensions = { ...defaultDimensions }
-        }
-        const je = await createJournalEntry(supabase, companyId, userId, {
-          fiscal_period_id: fiscalPeriodId,
-          entry_date: transaction.date,
-          description: desc,
-          source_type: 'invoice_paid',
-          source_id: invoice.id,
-          bank_booking_context: [bankBookingContext(transaction, paymentAccount)],
-          lines: clearingLines,
-        })
-        journalEntryId = je?.id ?? null
-      }
+      // left 1510 unclean. The open period was checked before the storno.
+      // The invoice's dimension bag rides every leg, FX result lines included
+      // (the builder stamps it), exactly as the match routes book it.
+      const { description, lines: clearingLines } = buildInvoiceMatchClearingLines(
+        {
+          amount: transaction.amount,
+          amount_sek: transaction.amount_sek ?? null,
+          currency: transaction.currency,
+          exchange_rate: transaction.exchange_rate ?? null,
+        },
+        {
+          currency: invoice.currency,
+          exchange_rate: invoice.exchange_rate ?? null,
+          remaining_amount: invoice.remaining_amount ?? null,
+          total: invoice.total,
+          paid_amount: invoice.paid_amount ?? null,
+          invoice_number: invoice.invoice_number,
+          customer: invoice.customer,
+          default_dimensions: (invoice as { default_dimensions?: unknown }).default_dimensions,
+        },
+        fx.required ? fx.paidInInvoiceCurrency : undefined,
+        paymentAccount,
+      )
+      const je = await createJournalEntry(supabase, companyId, userId, {
+        fiscal_period_id: fiscalPeriodId,
+        entry_date: transaction.date,
+        description,
+        source_type: 'invoice_paid',
+        source_id: invoice.id,
+        bank_booking_context: [bankBookingContext(transaction, paymentAccount)],
+        lines: clearingLines,
+      })
+      journalEntryId = je?.id ?? null
     }
   } catch (err) {
     // Recoverable: the dispatcher releases the op back to 'pending' and this
@@ -3755,7 +3422,19 @@ async function commitMatchTransactionInvoice(
     }
     log.error('Failed to create match journal entry:', err)
   }
-  if (journalEntryId) postedIds.payment_journal_entry_id = journalEntryId
+  // Fail closed, as the match routes do: the invoice is never marked paid
+  // without its payment verifikat. A storno posted above is reported as a
+  // partial commit rather than hidden behind a clean-looking refusal.
+  if (!journalEntryId) {
+    return {
+      error:
+        getErrorEntry('MATCH_INVOICE_RECORD_PAYMENT_FAILED')?.message_sv ??
+        'Kunde inte registrera fakturabetalningen.',
+      status: 500,
+      ...(Object.keys(postedIds).length > 0 ? { partialPostedIds: postedIds } : {}),
+    }
+  }
+  postedIds.payment_journal_entry_id = journalEntryId
 
   const { data: updatedRows, error: updateInvError } = await supabase
     .from('invoices')
@@ -3849,17 +3528,18 @@ async function commitMatchTransactionInvoice(
     })
     .eq('id', transactionId)
 
+  const settledInvoice = {
+    ...(invoice as Invoice),
+    status: newStatus,
+    paid_at: paidAt,
+    paid_amount: newPaidAmount,
+    remaining_amount: newRemaining,
+  } as Invoice
   try {
     await eventBus.emit({
       type: 'invoice.match_confirmed',
       payload: {
-        invoice: {
-          ...(invoice as Invoice),
-          status: newStatus,
-          paid_at: paidAt,
-          paid_amount: newPaidAmount,
-          remaining_amount: newRemaining,
-        } as Invoice,
+        invoice: settledInvoice,
         transaction: {
           ...(transaction as Transaction),
           invoice_id: invoiceId,
@@ -3873,6 +3553,16 @@ async function commitMatchTransactionInvoice(
       },
     })
   } catch { /* non-critical */ }
+  // A match that settles the invoice in full is its invoice.paid transition,
+  // exactly as on the dashboard and v1 match routes.
+  await emitInvoicePaidIfSettled({
+    newStatus,
+    invoice: settledInvoice,
+    paymentAmount: roundOre(newPaidAmount - (invoice.paid_amount ?? 0)),
+    paymentDate: transaction.date,
+    userId,
+    companyId,
+  })
 
   return { data: { invoice_status: newStatus, paid_amount: newPaidAmount, journal_entry_id: journalEntryId } }
 }
@@ -4054,6 +3744,11 @@ async function commitUncategorizeTransaction(
   return { data: { transaction_id: txId, reversed_journal_entry_id: journalEntryId } }
 }
 
+/**
+ * attach_document_to_transaction (gnubok_attach_document_to_transaction): the
+ * same rules as the dashboard route and the v1 operation
+ * transactions.attach-document, in lib/transactions/document-attach.ts.
+ */
 async function commitAttachDocumentToTransaction(
   supabase: SupabaseClient,
   userId: string,
@@ -4066,198 +3761,25 @@ async function commitAttachDocumentToTransaction(
     return { error: 'transaction_id and document_id are required', status: 400 }
   }
 
-  const { data: tx, error: txError } = await supabase
-    .from('transactions')
-    .select('id, document_id, journal_entry_id')
-    .eq('id', txId)
-    .eq('company_id', companyId)
-    .maybeSingle()
-  if (txError || !tx) return { error: 'Transaction not found', status: 404 }
-
-  const previousDocumentId = (tx.document_id as string | null) ?? null
-
-  // Pre-check: if the tx already has a doc and that doc is räkenskapsinformation,
-  // mirror the DELETE-route 409 instead of letting the DB trigger raise a
-  // raw check_violation. Same compliance message in both places.
-  if (tx.document_id && tx.document_id !== documentId) {
-    const { data: existing } = await supabase
-      .from('document_attachments')
-      .select('journal_entry_id')
-      .eq('id', tx.document_id)
-      .eq('company_id', companyId)
-      .maybeSingle()
-    if (existing?.journal_entry_id) {
-      return {
-        error:
-          'Bilagan är kopplad till en bokförd verifikation och kan inte ersättas. Storno verifikationen först.',
-        status: 409,
-      }
-    }
-  }
-
-  const { data: doc, error: docError } = await supabase
-    .from('document_attachments')
-    .select('id, journal_entry_id')
-    .eq('id', documentId)
-    .eq('company_id', companyId)
-    .maybeSingle()
-  if (docError || !doc) return { error: 'Document not found', status: 404 }
-
-  // A document that already serves as underlag for a DIFFERENT verifikation
-  // cannot be pinned here: propagating would either corrupt that link or be
-  // blocked by the document-metadata immutability trigger. Same verifikation
-  // is fine (idempotent re-attach; propagation below becomes a no-op). A
-  // bulk-booked tx keeps journal_entry_id null and is anchored through
-  // transaction_voucher_links, so that anchoring counts as "same" too.
-  // Mirrors the REST route in app/api/transactions/[id]/attach-document.
-  const docJournalEntryId = (doc.journal_entry_id as string | null) ?? null
-  if (docJournalEntryId && docJournalEntryId !== tx.journal_entry_id) {
-    const voucherLinked = await resolveVoucherLinkedEntryIds(supabase, companyId, [txId])
-    if (docJournalEntryId !== voucherLinked.get(txId)) {
-      return {
-        error: 'Underlaget är redan kopplat till en annan verifikation.',
-        status: 409,
-      }
-    }
-  }
-
-  // Race-free read of journal_entry_id: use UPDATE ... RETURNING so the value
-  // we propagate against reflects any concurrent categorize that committed
-  // before our UPDATE acquired the row lock. Reading the post-update state
-  // (rather than the pre-staging state) is what makes the
-  // attach-then-categorize and categorize-then-attach orderings produce the
-  // same final state: both end with document_attachments.journal_entry_id
-  // set to the tx's journal_entry_id. (BFL 5 kap 6 § verifikation underlag.)
-  const { data: postUpdate, error: updateError } = await supabase
-    .from('transactions')
-    .update({ document_id: documentId })
-    .eq('id', txId)
-    .eq('company_id', companyId)
-    .select('journal_entry_id')
-    .maybeSingle()
-
-  if (updateError) {
-    // The DB-level immutability trigger raises P0001 with a stable
-    // BFL_DOCUMENT_IMMUTABILITY: prefix when the previous doc is already
-    // räkenskapsinformation. Match on the prefix (not the generic SQLSTATE)
-    // so unrelated future exceptions don't get translated.
-    const errMsg = (updateError as { message?: string }).message ?? ''
-    if (errMsg.includes('BFL_DOCUMENT_IMMUTABILITY')) {
-      return {
-        error:
-          'Bilagan är kopplad till en bokförd verifikation och kan inte ersättas. Storno verifikationen först.',
-        status: 409,
-      }
-    }
-    return { error: 'Failed to attach document', status: 500 }
-  }
-  if (!postUpdate) return { error: 'Transaction not found', status: 404 }
-
-  // If the attached doc came from an invoice_inbox_items row, mark that row
-  // as matched so the inbox UI shows "Kopplad till transaktion". Best-effort:
-  // a failure must not roll back the (compliant) attach. Mirrors the REST
-  // route in app/api/transactions/[id]/attach-document/route.ts so MCP-staged
-  // and REST attaches converge on the same inbox state.
-  //
-  // The Supabase client resolves with { error } rather than rejecting on
-  // RLS/DB errors, so we destructure rather than try/catch.
-  const { error: inboxLinkErr } = await supabase
-    .from('invoice_inbox_items')
-    .update({ matched_transaction_id: txId })
-    .eq('document_id', documentId)
-    .eq('company_id', companyId)
-    .is('matched_transaction_id', null)
-    .is('created_supplier_invoice_id', null)
-  if (inboxLinkErr) {
-    console.error('[commitAttach] Failed to link inbox item:', inboxLinkErr)
-  }
-
-  const journalEntryId = postUpdate.journal_entry_id as string | null
-  // Skip when the doc already points at this verifikation: the period-lock
-  // trigger raises on ANY journal_entry_id write (even a same-value rewrite),
-  // so an unconditional re-run would 500 an otherwise idempotent re-attach
-  // once the period locks.
-  if (journalEntryId && docJournalEntryId !== journalEntryId) {
-    const { error: linkErr } = await supabase
-      .from('document_attachments')
-      .update({ journal_entry_id: journalEntryId })
-      .eq('id', documentId)
-      .eq('company_id', companyId)
-    if (linkErr) {
-      // The enforce_period_lock trigger blocks journal_entry_id writes when
-      // the target entry sits in a closed/locked period. Map to 409: the
-      // dispatcher auto-rejects it, and a retry could never succeed until the
-      // period is unlocked, so "försök igen" would be a false promise.
-      const linkMsg = (linkErr as { message?: string }).message ?? ''
-      if (/locked\/closed fiscal period|Bokföringen är låst/i.test(linkMsg)) {
-        return {
-          error:
-            'Bilagan kopplades till transaktionen men verifikationens period är låst: den kunde inte länkas till verifikationen.',
-          status: 409,
-        }
-      }
-      // Surface the propagation failure rather than logging-and-continuing.
-      // BFL 5 kap 6 § requires the verifikation to reference its underlag, so
-      // a "succeeded" attach that left document_attachments.journal_entry_id
-      // null would be a silent compliance gap. Failing here marks the op
-      // failed; a retry is idempotent (same documentId on tx, same propagate
-      // target) and will replay the document_attachments UPDATE.
-      console.error('[commitAttach] Failed to propagate to journal entry:', linkErr)
-      return {
-        error:
-          'Bilagan kopplades till transaktionen men kunde inte länkas till verifikationen. Försök igen: operationen är idempotent.',
-        status: 500,
-      }
-    }
-  }
-
-  // The transaction may already be booked, directly or via a bulk-book
-  // samlingsverifikat (journal_entry_id null, anchored through
-  // transaction_voucher_links): complete the matched inbox items against the
-  // anchoring verifikat so an after-the-fact attach resolves them instead of
-  // stranding them as "linked" forever. Best-effort, logged inside. Returns
-  // the anchoring verifikat (the direct id when there is one), so the result
-  // and audit trail can report the voucher-linked case too.
-  const effectiveJournalEntryId = await completeInboxItemsForBookedTransaction(
-    supabase,
-    companyId,
+  const outcome = await attachDocumentToTransaction(
+    { supabase, companyId, userId, log: log.child({ operation: 'attach_document_to_transaction' }) },
     txId,
-    { directJournalEntryId: journalEntryId },
+    documentId,
   )
-
-  // Rättelse audit trail (BFL 5 kap 5 §): if we replaced a non-null doc, log
-  // the swap to processing_history so the original is traceable. Best-effort:
-  // a logging failure must not roll back the (compliant) attach.
-  if (previousDocumentId && previousDocumentId !== documentId) {
-    try {
-      await appendProcessingHistory({
-        companyId,
-        correlationId: txId,
-        aggregateType: 'BankTransaction',
-        aggregateId: txId,
-        eventType: 'TransactionDocumentReplaced',
-        payload: {
-          transaction_id: txId,
-          previous_document_id: previousDocumentId,
-          new_document_id: documentId,
-          journal_entry_id: effectiveJournalEntryId,
-        },
-        actor: { type: 'user', id: userId },
-        occurredAt: new Date(),
-      })
-    } catch (logErr) {
-      console.error('[commitAttach] Failed to append rättelse event:', logErr)
+  if (!outcome.ok) {
+    if (outcome.error) {
+      if (isBookkeepingError(outcome.error)) throw outcome.error
+      return { error: 'Failed to attach document', status: 500 }
+    }
+    const entry = getErrorEntry(outcome.code)
+    return {
+      error: outcome.messageSv || entry?.message_sv || outcome.code,
+      errorCode: outcome.code,
+      status: entry?.httpStatus ?? 400,
     }
   }
-
-  return {
-    data: {
-      transaction_id: txId,
-      document_id: documentId,
-      previous_document_id: previousDocumentId,
-      journal_entry_id: effectiveJournalEntryId,
-    },
-  }
+  if (outcome.dryRun) return { data: outcome.preview }
+  return { data: { ...outcome.data } }
 }
 
 /**
@@ -4528,6 +4050,9 @@ async function commitRunYearEnd(
   }
 }
 
+// Unreachable while isKontantmetodCutoffSuspended() is true (#3440): the
+// dispatcher refuses post_kontantmetod_cutoff before the claim, so a refused
+// op stays pending. A refusal in here would run after the claim and consume it.
 async function commitPostKontantmetodCutoff(
   supabase: SupabaseClient,
   userId: string,
@@ -4979,6 +4504,19 @@ async function commitCreateSupplierInvoiceFromInbox(
     return { error: 'exchange_rate must be a finite number when provided', status: 400 }
   }
 
+  // Every item carries its own account, under the rule the create routes
+  // hold (CreateSupplierInvoiceItemSchema: four digits). Staging resolves
+  // and checks it, so a miss here is a stale or tampered op: refuse it
+  // before an ankomstnummer is drawn instead of guessing one.
+  if (rawItems.some((item) => typeof item.account_number !== 'string' || !ACCOUNT_NUMBER_RE.test(item.account_number))) {
+    const entry = getErrorEntry('SI_CREATE_ITEM_ACCOUNT_MISSING')
+    return {
+      error: entry?.message_sv ?? 'En eller flera fakturarader saknar konto.',
+      errorCode: 'SI_CREATE_ITEM_ACCOUNT_MISSING',
+      status: entry?.httpStatus ?? 400,
+    }
+  }
+
   // Särskild löneskatt (SLP): staged params must respect the same rule the
   // create routes enforce; the 7533/2514 pair is only lawful on 741x pension
   // premiums, so a flag on any other account is tampered or mis-staged.
@@ -5000,7 +4538,7 @@ async function commitCreateSupplierInvoiceFromInbox(
   // is the source of truth.
   const { data: inbox, error: inboxErr } = await supabase
     .from('invoice_inbox_items')
-    .select('id, created_supplier_invoice_id, status')
+    .select('id, created_supplier_invoice_id, status, kind_hint, extracted_data')
     .eq('id', inboxItemId)
     .eq('company_id', companyId)
     .single()
@@ -5013,6 +4551,18 @@ async function commitCreateSupplierInvoiceFromInbox(
         inbox_item_id: inboxItemId,
         idempotent: true,
       },
+    }
+  }
+
+  // A credit note is never a payable of its own (issue #2980): an operation
+  // staged before the item read as one, or with negative amounts, is refused
+  // here; the credit goes through gnubok_credit_supplier_invoice.
+  if (resolveInboxKind(inbox) === 'credit_note' || total < 0 || subtotal < 0) {
+    const entry = getErrorEntry('INBOX_ITEM_IS_CREDIT_NOTE')
+    return {
+      error: entry?.message_sv ?? 'Posten är en kreditfaktura.',
+      errorCode: 'INBOX_ITEM_IS_CREDIT_NOTE',
+      status: entry?.httpStatus ?? 409,
     }
   }
 
@@ -5062,6 +4612,14 @@ async function commitCreateSupplierInvoiceFromInbox(
     }
   }
 
+  // Booking mode for the registration verifikat, and the VAT registration
+  // the item rows depend on: read once, before an ankomstnummer is drawn.
+  const { data: settings } = await supabase
+    .from('company_settings')
+    .select('accounting_method, defer_invoice_booking, vat_registered')
+    .eq('company_id', companyId)
+    .single()
+
   const { data: arrivalNum, error: arrivalErr } = await supabase
     .rpc('get_next_arrival_number', { p_company_id: companyId })
 
@@ -5070,11 +4628,58 @@ async function commitCreateSupplierInvoiceFromInbox(
   }
 
   const reverseCharge = vatTreatment === 'reverse_charge'
+  // Icke momsregistrerad (feedback seq 708521): the seller's moms is part of
+  // the cost, never 2641. Staging folds it into the lines; an op staged
+  // before that fix (net lines plus 25 %) or a tampered one is folded here
+  // too, so no op can book input VAT the company can never reclaim.
+  const vatIsCost = sellerVatIsCost(settings?.vat_registered, reverseCharge)
   // Treatments under which no seller VAT may reach the books: reverse charge
   // (the buyer self-assesses on 2614/2645) and exempt / export, where the
   // supplier charged no Swedish moms at all so there is nothing deductible
   // (issue #2553). Both take the same header and item treatment below.
-  const noDeductibleSellerVat = reverseCharge || !treatmentDeductsInputVat(vatTreatment)
+  const noDeductibleSellerVat = !vatIsCost && (reverseCharge || !treatmentDeductsInputVat(vatTreatment))
+
+  // RC invariant: a reverse-charge supplier invoice never shows output VAT
+  // from the supplier. Zero any per-line VAT that slipped through staging so
+  // the registration JE's 2614/2645 self-assessed leg lines up with rutor
+  // 20-24 / 48 instead of double-counting input VAT into 2641. Tampered
+  // params can't smuggle non-zero VAT into the items table.
+  //
+  // Exempt and export invoices take the same zeroing (issue #2553): the
+  // supplier charged no Swedish moms, so a rate that came from OCR, from a
+  // stale staged op or from the column's own 0.25 default has nothing to
+  // deduct behind it. The engine refuses to book 2641 for these treatments
+  // either way; storing 0 keeps the row honest about what the underlag says.
+  const itemRows = rawItems.map((item, idx) => {
+    // Normalize percent-shaped rates (25 -> 0.25) and snap to the statutory
+    // set: rows staged before the issue #310 fix (or tampered params) carry
+    // percent integers, and inserting one books 2500 % VAT downstream.
+    const vatRate = noDeductibleSellerVat ? 0 : (typeof item.vat_rate === 'number' ? normalizeVatRateToDecimal(item.vat_rate) : 0)
+    const vatAmt = noDeductibleSellerVat ? 0 : (typeof item.vat_amount === 'number' && Number.isFinite(item.vat_amount) ? item.vat_amount : 0)
+    return {
+      sort_order: idx,
+      description: String(item.description ?? `Position ${idx + 1}`),
+      quantity: typeof item.quantity === 'number' && Number.isFinite(item.quantity) ? item.quantity : 1,
+      unit: (item.unit as string | undefined) ?? 'st',
+      unit_price: typeof item.unit_price === 'number' && Number.isFinite(item.unit_price) ? item.unit_price : 0,
+      line_total: typeof item.line_total === 'number' && Number.isFinite(item.line_total) ? item.line_total : 0,
+      account_number: item.account_number as string,
+      vat_code: null,
+      vat_rate: vatRate,
+      vat_amount: vatAmt,
+      // For reverse charge the buyer self-assesses VAT; carry an explicit
+      // statutory rate when staged, else null (engine defaults to 25%).
+      reverse_charge_rate: reverseCharge
+        ? ([0.06, 0.12, 0.25].includes(Number(item.reverse_charge_rate)) ? Number(item.reverse_charge_rate) : null)
+        : null,
+      // Särskild löneskatt (SLP): booking injects the self-balancing
+      // 7533/2514 pair for this line. Validated above (741x accounts only).
+      apply_slp: item.apply_slp === true,
+      dimensions: coerceDimensionsBag(item.dimensions) ?? {},
+    }
+  })
+  const items = vatIsCost ? foldSellerVatIntoCost(itemRows).lines : itemRows
+
   // Omvänd skattskyldighet: the registration entry credits 2440 with the sum
   // of the line nets (the fiktiv 2614/2645 pair nets to zero), so that sum is
   // the only payable the reskontra can carry. Staging registers the net since
@@ -5085,11 +4690,14 @@ async function commitCreateSupplierInvoiceFromInbox(
   // charged on a reverse-charge invoice is not deductible and is not booked.
   // An exempt or export op is the same shape: the items below carry no VAT,
   // so a staged header that still carries some would leave the reskontra
-  // above what the registration entry credits on 2440.
-  const itemNetSum = rawItems.reduce((sum, item) => sum + (finite(item.line_total) ?? 0), 0)
-  const subtotalRounded = noDeductibleSellerVat ? roundOre(itemNetSum) : Math.round(subtotal * 100) / 100
-  const vatAmountRounded = noDeductibleSellerVat ? 0 : Math.round(vatAmount * 100) / 100
-  const totalRounded = noDeductibleSellerVat ? subtotalRounded : Math.round(total * 100) / 100
+  // above what the registration entry credits on 2440. A non-registered
+  // company's rows carry the seller's moms as cost, so their sum is its
+  // payable for the same reason.
+  const headerFromItems = noDeductibleSellerVat || vatIsCost
+  const itemNetSum = items.reduce((sum, item) => sum + item.line_total, 0)
+  const subtotalRounded = headerFromItems ? roundOre(itemNetSum) : Math.round(subtotal * 100) / 100
+  const vatAmountRounded = headerFromItems ? 0 : Math.round(vatAmount * 100) / 100
+  const totalRounded = headerFromItems ? subtotalRounded : Math.round(total * 100) / 100
   // Fed the already-rounded figures so a SEK invoice (rate 1) gets
   // total_sek === total to the öre instead of the two roundings disagreeing on
   // an exact-half value. The old `exchangeRate ? … : null` guard left all three
@@ -5187,46 +4795,7 @@ async function commitCreateSupplierInvoiceFromInbox(
     return { error: 'Failed to create supplier invoice', status: 500 }
   }
 
-  // RC invariant: a reverse-charge supplier invoice never shows output VAT
-  // from the supplier. Zero any per-line VAT that slipped through staging so
-  // the registration JE's 2614/2645 self-assessed leg lines up with rutor
-  // 20-24 / 48 instead of double-counting input VAT into 2641. Tampered
-  // params can't smuggle non-zero VAT into the items table.
-  //
-  // Exempt and export invoices take the same zeroing (issue #2553): the
-  // supplier charged no Swedish moms, so a rate that came from OCR, from a
-  // stale staged op or from the column's own 0.25 default has nothing to
-  // deduct behind it. The engine refuses to book 2641 for these treatments
-  // either way; storing 0 keeps the row honest about what the underlag says.
-  const itemInserts = rawItems.map((item, idx) => {
-    // Normalize percent-shaped rates (25 -> 0.25) and snap to the statutory
-    // set: rows staged before the issue #310 fix (or tampered params) carry
-    // percent integers, and inserting one books 2500 % VAT downstream.
-    const vatRate = noDeductibleSellerVat ? 0 : (typeof item.vat_rate === 'number' ? normalizeVatRateToDecimal(item.vat_rate) : 0)
-    const vatAmt = noDeductibleSellerVat ? 0 : (typeof item.vat_amount === 'number' && Number.isFinite(item.vat_amount) ? item.vat_amount : 0)
-    return {
-      supplier_invoice_id: invoice.id,
-      sort_order: idx,
-      description: String(item.description ?? `Position ${idx + 1}`),
-      quantity: typeof item.quantity === 'number' && Number.isFinite(item.quantity) ? item.quantity : 1,
-      unit: (item.unit as string | undefined) ?? 'st',
-      unit_price: typeof item.unit_price === 'number' && Number.isFinite(item.unit_price) ? item.unit_price : 0,
-      line_total: typeof item.line_total === 'number' && Number.isFinite(item.line_total) ? item.line_total : 0,
-      account_number: String(item.account_number ?? '4000'),
-      vat_code: null,
-      vat_rate: vatRate,
-      vat_amount: vatAmt,
-      // For reverse charge the buyer self-assesses VAT; carry an explicit
-      // statutory rate when staged, else null (engine defaults to 25%).
-      reverse_charge_rate: reverseCharge
-        ? ([0.06, 0.12, 0.25].includes(Number(item.reverse_charge_rate)) ? Number(item.reverse_charge_rate) : null)
-        : null,
-      // Särskild löneskatt (SLP): booking injects the self-balancing
-      // 7533/2514 pair for this line. Validated above (741x accounts only).
-      apply_slp: item.apply_slp === true,
-      dimensions: coerceDimensionsBag(item.dimensions) ?? {},
-    }
-  })
+  const itemInserts = items.map((item) => ({ supplier_invoice_id: invoice.id, ...item }))
 
   const { error: itemsErr } = await supabase
     .from('supplier_invoice_items')
@@ -5244,12 +4813,6 @@ async function commitCreateSupplierInvoiceFromInbox(
     })
     return { error: 'Failed to insert supplier invoice items', status: 500 }
   }
-
-  const { data: settings } = await supabase
-    .from('company_settings')
-    .select('accounting_method, defer_invoice_booking')
-    .eq('company_id', companyId)
-    .single()
 
   let registrationJournalEntryId: string | null = null
 
@@ -5397,97 +4960,40 @@ async function commitCreditSupplierInvoice(
   const id = params.supplier_invoice_id as string
   if (!id) return { error: 'supplier_invoice_id is required', status: 400 }
 
-  const { data: original, error: fetchError } = await supabase
-    .from('supplier_invoices')
-    .select('*, supplier:suppliers(*), items:supplier_invoice_items(*)')
-    .eq('id', id)
-    .eq('company_id', companyId)
-    .single()
-
-  if (fetchError || !original) return { error: 'Supplier invoice not found', status: 404 }
-  if (original.status === 'credited') return { error: 'Fakturan har redan krediterats', status: 409 }
-
-  const { data: arrivalNum } = await supabase.rpc('get_next_arrival_number', { p_company_id: companyId })
-
-  const { data: creditNote, error: creditError } = await supabase
-    .from('supplier_invoices')
-    .insert(
-      buildSupplierCreditNoteRow(original, {
-        userId,
-        companyId,
-        arrivalNumber: arrivalNum,
-        date: new Date().toISOString().split('T')[0],
-      }),
-    )
-    .select()
-    .single()
-
-  if (creditError || !creditNote) return { error: creditError?.message ?? 'Failed to create credit note', status: 500 }
-
-  const creditItems = (original.items ?? []).map((item: Record<string, unknown>) => ({
-    supplier_invoice_id: creditNote.id,
-    sort_order: item.sort_order,
-    description: item.description,
-    quantity: item.quantity,
-    unit: item.unit,
-    unit_price: item.unit_price,
-    line_total: item.line_total,
-    account_number: item.account_number,
-    vat_code: item.vat_code,
-    vat_rate: normalizeVatRateToFraction(item.vat_rate),
-    vat_amount: item.vat_amount,
-    dimensions: item.dimensions ?? {},
-  }))
-  await supabase.from('supplier_invoice_items').insert(creditItems)
-
-  const { data: settings } = await supabase
-    .from('company_settings').select('accounting_method').eq('company_id', companyId).single()
-  const accountingMethod = settings?.accounting_method || 'accrual'
-
-  let journalEntryId: string | null = null
-  // Kontantmetoden skips only while the original is still UNPAID: a paid one
-  // was already booked by its payment verifikat (expense + 2641 ingående
-  // moms), and leaving that un-reversed overstates cost and moms deduction.
-  if (supplierCreditNoteNeedsJournalEntry(accountingMethod, original)) {
-    try {
-      const je = await createSupplierCreditNoteEntry(
-        supabase,
-        companyId,
-        userId,
-        creditNote,
-        original.items as never,
-        original.supplier?.supplier_type || 'swedish_business',
-        original.supplier?.name
-      )
-      if (je) {
-        journalEntryId = je.id
-        await supabase
-          .from('supplier_invoices')
-          .update({ registration_journal_entry_id: je.id })
-          .eq('id', creditNote.id)
-      }
-    } catch (err) {
-      await supabase.from('supplier_invoices').delete().eq('id', creditNote.id).eq('company_id', companyId)
-      return failUnlessBookkeepingError(err, 'Failed to book credit note', 500)
+  // The same service as the dashboard and v1 routes (issue #2980): the MCP
+  // copy of this flow never stopped periodisering schedules or carried the
+  // reverse-charge rate and SLP flag onto the credit note. Only the inputs
+  // gnubok_credit_supplier_invoice stages are passed on.
+  const parsed = CreditSupplierInvoiceInputSchema.safeParse({
+    ...(typeof params.inbox_item_id === 'string' ? { inbox_item_id: params.inbox_item_id } : {}),
+  })
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? 'Invalid params', errorCode: 'VALIDATION_ERROR', status: 400 }
+  }
+  const outcome = await creditSupplierInvoice(
+    { supabase, companyId, userId, log: log.child({ operation: 'credit_supplier_invoice' }) },
+    id,
+    parsed.data,
+  )
+  if (!outcome.ok) {
+    if (outcome.error) throw outcome.error
+    const entry = getErrorEntry(outcome.code)
+    return {
+      error: outcome.messageSv || entry?.message_sv || outcome.code,
+      errorCode: outcome.code,
+      status: entry?.httpStatus ?? 400,
     }
   }
-
-  const newRemaining = Math.max(0, original.remaining_amount - original.total)
-  const newStatus = newRemaining <= 0 ? 'credited' : original.status
-
-  await supabase
-    .from('supplier_invoices')
-    .update({ status: newStatus, remaining_amount: newRemaining })
-    .eq('id', id)
-
-  try {
-    await eventBus.emit({
-      type: 'supplier_invoice.credited',
-      payload: { supplierInvoice: original, creditNote, companyId, userId },
-    })
-  } catch { /* non-blocking */ }
-
-  return { data: { credit_note_id: creditNote.id, journal_entry_id: journalEntryId } }
+  if (outcome.dryRun) return { data: outcome.preview }
+  return {
+    data: {
+      credit_note_id: outcome.data.credit_note.id,
+      journal_entry_id: outcome.data.journal_entry_id,
+      document_id: outcome.data.document_id,
+      inbox_item_id: outcome.data.inbox_item_id,
+      ...(outcome.warnings && outcome.warnings.length > 0 ? { warnings: outcome.warnings } : {}),
+    },
+  }
 }
 
 async function commitCreditInvoice(
@@ -5554,6 +5060,9 @@ async function commitCreditInvoice(
       vat_rate: original.vat_rate,
       moms_ruta: original.moms_ruta,
       reverse_charge_text: original.reverse_charge_text,
+      // The same supply (#2906): goods delivered abroad reverse on 3105 / 3108.
+      vat_treatment_override: original.vat_treatment_override ?? null,
+      delivery_country: original.delivery_country ?? null,
       your_reference: original.your_reference,
       our_reference: original.our_reference,
       invoice_marking: original.invoice_marking ?? null,
@@ -6534,9 +6043,15 @@ async function commitSetRunSalary(
 ): Promise<ExecutorResult> {
   const salaryRunId = params.salary_run_id as string
   const employeeId = params.employee_id as string
-  const monthlySalary = params.monthly_salary as number
-  if (!salaryRunId || !employeeId || typeof monthlySalary !== 'number') {
-    return { error: 'salary_run_id, employee_id and monthly_salary are required', status: 400 }
+  const monthlySalary = params.monthly_salary as number | undefined
+  const hoursWorked = params.hours_worked as number | undefined
+  const hasMonthly = typeof monthlySalary === 'number'
+  const hasHours = typeof hoursWorked === 'number'
+  if (!salaryRunId || !employeeId || hasMonthly === hasHours) {
+    return {
+      error: 'salary_run_id, employee_id and exactly one of monthly_salary / hours_worked are required',
+      status: 400,
+    }
   }
 
   try {
@@ -6545,7 +6060,7 @@ async function commitSetRunSalary(
       companyId,
       salaryRunId,
       employeeId,
-      monthlySalary,
+      ...(hasMonthly ? { monthlySalary } : { hoursWorked }),
     })
     if (!result.ok) {
       const entry = getErrorEntry(result.code)
@@ -6561,6 +6076,8 @@ async function commitSetRunSalary(
         employee_id: result.data.employee_id,
         previous_monthly_salary: result.data.previous_monthly_salary,
         monthly_salary: result.data.monthly_salary,
+        previous_hours_worked: result.data.previous_hours_worked,
+        hours_worked: result.data.hours_worked,
       },
     }
   } catch (err) {
@@ -6783,7 +6300,13 @@ async function commitBookSalaryRun(
         error: [entry?.message_sv ?? `Kunde inte bokföra lönekörningen: ${result.code}`, detail]
           .filter(Boolean)
           .join(' '),
+        // The agent branches on the code: SALARY_RUN_BOOKING_IN_PROGRESS
+        // means wait and re-read the run, not approve again at once. That
+        // refusal posted nothing, so the op stays pending for a later
+        // approval instead of being auto-rejected as a 409.
+        errorCode: result.code,
         status: entry?.httpStatus ?? 500,
+        ...(result.code === 'SALARY_RUN_BOOKING_IN_PROGRESS' ? { returnToPending: true } : {}),
       }
     }
     const run = result.data.run as { period_year?: number; period_month?: number; status?: string }
@@ -6800,6 +6323,12 @@ async function commitBookSalaryRun(
       },
     }
   } catch (err) {
+    // Posted vouchers of the run that the booking would not post
+    // (SalaryRunPartiallyBookedError): the Swedish message names them, and a
+    // retry cannot succeed until they are reversed, so it is not a 500.
+    if ((err as { code?: unknown } | null)?.code === 'SALARY_RUN_PARTIALLY_BOOKED') {
+      return { error: (err as Error).message, errorCode: 'SALARY_RUN_PARTIALLY_BOOKED', status: 409 }
+    }
     return {
       error: err instanceof Error ? err.message : 'Failed to book salary run',
       status: 500,
@@ -7046,9 +6575,20 @@ async function commitBookSkattekontoRows(
   if (ids.length === 0) {
     return { error: 'ids (eller transaction_id) krävs', status: 400 }
   }
+  // Rows approved for booking although the ledger already holds a verifikat
+  // for the event: the batch op stores allow_duplicate_ids, the single-row op
+  // allow_duplicate. Anything else keeps the ledger-twin guard on.
+  const allowDuplicateIds = Array.isArray(params.allow_duplicate_ids)
+    ? params.allow_duplicate_ids.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : params.allow_duplicate === true
+      ? ids
+      : []
 
   const services = getSkattekontoBookingService()
-  const result = await services.commitBookSkattekontoRows(supabase, userId, companyId, { ids })
+  const result = await services.commitBookSkattekontoRows(supabase, userId, companyId, {
+    ids,
+    ...(allowDuplicateIds.length > 0 ? { allow_duplicate_ids: allowDuplicateIds } : {}),
+  })
   if (!result.ok) {
     if (result.recoverable) {
       throw new SkatteverketRecoverableError(result.error, result.code, result.http_status)
@@ -7210,6 +6750,16 @@ async function commitMatchBatchAllocate(
   // (app/api/transactions/[id]/match-batch/route.ts) so the two cannot drift.
   await clearSettledBatchAllocationSuggestions(supabase, companyId, result.allocations ?? [], txId)
 
+  // Same events as the HTTP twin (match_confirmed per allocation, invoice.paid
+  // / supplier_invoice.paid per allocation settled in full), through the same
+  // helper. This door used to emit nothing, so webhooks never heard of an
+  // agent-approved samlingsbetalning. Best-effort: the RPC has committed.
+  await emitBatchAllocationEvents(
+    supabase,
+    { companyId, userId, transactionId: txId, allocations: result.allocations ?? [] },
+    log,
+  )
+
   // The override was acted on: durable behandlingshistorik record (BFNAR
   // 2013:2 p. 9.16), same event the categorize guard writes.
   if (explained.status === 'overridden') {
@@ -7258,11 +6808,12 @@ async function commitBulkBookTransactions(
   //   - `auth.uid()` resolves the caller; membership checked against
   //     `company_members.company_id = p_company_id`.
   // The MCP execute() handler additionally pre-checks tx ownership +
-  // JE ownership at stage time to surface clean errors. This commit
-  // handler is a thin pass-through by design.
+  // JE ownership at stage time to surface clean errors. The one rule this
+  // handler runs itself is the dimension policy, which the RPC does not:
+  // rules may have changed and a value may have been archived since staging.
   const txIds = params.tx_ids
   const existingJeId = (params.existing_journal_entry_id as string | null | undefined) ?? null
-  const newEntry = (params.new_entry as Record<string, unknown> | null | undefined) ?? null
+  let newEntry = (params.new_entry as Record<string, unknown> | null | undefined) ?? null
   if (!Array.isArray(txIds) || txIds.length === 0) {
     return { error: 'tx_ids is required (non-empty array)', status: 400 }
   }
@@ -7271,6 +6822,17 @@ async function commitBulkBookTransactions(
       error: 'Provide exactly one of existing_journal_entry_id or new_entry',
       status: 400,
     }
+  }
+  if (newEntry && Array.isArray(newEntry.lines) && newEntry.lines.length > 0) {
+    // Throws the typed MandatoryDimensionMissingError / DimensionValidationError;
+    // the dispatcher maps a BookkeepingError like every ledger executor's.
+    const lines = await enforceBulkBookDimensionPolicy(
+      supabase,
+      companyId,
+      newEntry.lines as Array<{ account_number: string; dimensions?: Record<string, string> }>,
+      log,
+    )
+    newEntry = { ...newEntry, lines }
   }
   const { data, error } = await supabase.rpc('bulk_book_transactions', {
     p_tx_ids: txIds,
@@ -7628,6 +7190,25 @@ async function commitPendingOperationInner(
   pendingOp: PendingOperation,
   opts: CommitOptions = {}
 ): Promise<CommitResult> {
+  // ── Kontantmetoden cut-off suspension (#3440). The cut-off as built declares
+  //    unpaid-invoice moms a second time when the invoice is paid next year.
+  //    Refused HERE, before the atomic claim and before any read or write, for
+  //    the same reason as the gates below: a refused op must stay 'pending'
+  //    (not consumed), so it is still there when the fix decides what to do
+  //    with it. The staging door reads the same switch.
+  if (
+    pendingOp.operation_type === 'post_kontantmetod_cutoff' &&
+    isKontantmetodCutoffSuspended()
+  ) {
+    return {
+      status: 'failed',
+      error: kontantmetodCutoffSuspendedMessageSv(),
+      http_status: getErrorEntry(KONTANTMETOD_CUTOFF_SUSPENDED_CODE)?.httpStatus ?? 409,
+      code: KONTANTMETOD_CUTOFF_SUSPENDED_CODE,
+      operation_status: 'pending',
+    }
+  }
+
   // ── Capability gate (commit-time twin of the MCP dispatch gate). The actual
   //    external-service call (email / Skatteverket submit) happens below, so
   //    this is the true paid chokepoint: it also catches an op STAGED during
@@ -7731,9 +7312,6 @@ async function commitPendingOperationInner(
       case 'update_recurring_schedule':
         result = await commitUpdateRecurringSchedule(supabase, companyId, pendingOp.params)
         break
-      case 'update_company_settings':
-        result = await commitUpdateCompanySettings(supabase, companyId, pendingOp.params)
-        break
       case 'create_article':
         result = await commitCreateArticle(supabase, userId, companyId, pendingOp.params)
         break
@@ -7742,12 +7320,6 @@ async function commitPendingOperationInner(
         break
       case 'create_supplier':
         result = await commitCreateSupplier(supabase, userId, companyId, pendingOp.params)
-        break
-      case 'create_account':
-        result = await commitCreateAccount(supabase, userId, companyId, pendingOp.params)
-        break
-      case 'update_account':
-        result = await commitUpdateAccount(supabase, userId, companyId, pendingOp.params)
         break
       case 'set_voucher_note':
         result = await commitSetVoucherNote(supabase, companyId, pendingOp.params)
@@ -7968,12 +7540,20 @@ async function commitPendingOperationInner(
       case 'submit_agi':
         result = await commitSubmitAgi(supabase, userId, companyId, pendingOp.params)
         break
-      default:
-        return {
-          status: 'failed',
-          error: `Unknown operation type: ${pendingOp.operation_type}`,
-          http_status: 400,
+      default: {
+        // Operations defined once in lib/operations run through the same
+        // run() the v1 and MCP doors use; everything else is unknown.
+        const operation = operationForPendingType(pendingOp.operation_type)
+        if (!operation) {
+          return {
+            status: 'failed',
+            error: `Unknown operation type: ${pendingOp.operation_type}`,
+            http_status: 400,
+          }
         }
+        result = await commitRegisteredOperation(operation, supabase, userId, companyId, pendingOp.params)
+        break
+      }
     }
   } catch (err) {
     // Partial commit (issue #842): the executor already posted an
@@ -8096,8 +7676,9 @@ async function commitPendingOperationInner(
     // caller that IS authorized (the /pending UI, or a key with the scope),
     // instead of vanishing as 'rejected'. Feedback seq 261545: three
     // samlingsverifikat were consumed this way and the user believed they
-    // had been approved.
-    if (result.status === 401 || result.status === 403) {
+    // had been approved. An executor may ask for the same release for a
+    // transient, side-effect-free refusal (returnToPending).
+    if (result.status === 401 || result.status === 403 || result.returnToPending) {
       await supabase
         .from('pending_operations')
         .update({ status: 'pending' })

@@ -48,6 +48,8 @@ import {
   usesPersonnummerAsOrgNumber,
 } from '@/lib/company/entity-type'
 import { suggestedFormForOrgNumber } from '@/lib/onboarding-journey/org-number-hint'
+import { shouldGateDuplicate, type ExistingCompanyMatch } from '@/lib/onboarding-journey/duplicate-gate'
+import { performCompanySwitch } from '@/lib/company/switch-client'
 import JourneyOrb, { type OrbState } from './JourneyOrb'
 
 /** The two chips every picker shows (AB first, as before). */
@@ -73,10 +75,14 @@ function pickerForms(orgNumber: string | null | undefined): { chips: EntityType[
 }
 
 /** i18n key per legal form for the picker chips and the summary card. */
-const FORM_LABEL_KEY: Record<EntityType, 'journey_form_ab' | 'journey_form_ef' | 'journey_form_forening'> = {
+const FORM_LABEL_KEY: Record<
+  EntityType,
+  'journey_form_ab' | 'journey_form_ef' | 'journey_form_forening' | 'journey_form_ekonomisk_forening'
+> = {
   aktiebolag: 'journey_form_ab',
   enskild_firma: 'journey_form_ef',
   ideell_forening: 'journey_form_forening',
+  ekonomisk_forening: 'journey_form_ekonomisk_forening',
 }
 
 /**
@@ -87,6 +93,7 @@ const FORM_INFO_KEY: Record<EntityType, 'journey_form_info_forening' | null> = {
   aktiebolag: null,
   enskild_firma: null,
   ideell_forening: 'journey_form_info_forening',
+  ekonomisk_forening: null,
 }
 
 /** Statutory label for a planned-form code the reducer stored, or null. */
@@ -198,7 +205,17 @@ export default function OnboardingJourney({
   const [thinking, setThinking] = useState(false)
   const [narration, setNarration] = useState<string | null>(null)
   const [monogram, setMonogram] = useState<string | null>(null)
+  // Säte as the register gave it at creation (SCB Säteskommun). The postal
+  // town in settings.city is never shown as säte.
+  const [registeredOffice, setRegisteredOffice] = useState<string | null>(null)
   const [dupName, setDupName] = useState<string | null>(null)
+  // The company the user already has under the org number being set up, and
+  // the org number they explicitly chose a separate copy for. Together they
+  // drive the duplicate stop (shouldGateDuplicate).
+  const [dupMatch, setDupMatch] = useState<ExistingCompanyMatch | null>(null)
+  const [dupAckOrg, setDupAckOrg] = useState<string | null>(null)
+  const [dupOpening, setDupOpening] = useState(false)
+  const [dupSwitchFailed, setDupSwitchFailed] = useState(false)
   // The SCB picker: rows for the current text, whether SCB cut the list,
   // and the keyboard-highlighted row (-1: none, Enter runs the Enter path).
   const [suggestions, setSuggestions] = useState<CompanySuggestion[]>([])
@@ -253,16 +270,29 @@ export default function OnboardingJourney({
     window.setTimeout(() => setOrgShake(false), 400)
   }, [])
 
+  const dupCheckedOrg = useRef<string | null>(null)
   const checkDuplicate = useCallback((orgNumber: string) => {
     setDupName(null)
+    setDupMatch(null)
+    const canonical = normalizeOrgNumber(orgNumber)
+    dupCheckedOrg.current = canonical
     fetch(`/api/company/check-org-number?org_number=${encodeURIComponent(orgNumber)}`)
       .then(async (res) => {
         if (!res.ok) return
         const { data } = await res.json()
-        setDupName(data?.companies?.[0]?.name ?? null)
+        const first = data?.companies?.[0] as { id: string; name: string } | undefined
+        setDupName(first?.name ?? null)
+        setDupMatch(first && canonical ? { orgNumber: canonical, companyId: first.id, name: first.name } : null)
       })
       .catch(() => {})
   }, [])
+
+  // A restored draft (Back/refresh) lands past the orgnr step without the
+  // submit that normally runs the check, which would skip the duplicate stop.
+  const draftOrg = state.step === 'orgnr' ? null : normalizeOrgNumber(state.settings.org_number ?? '')
+  useEffect(() => {
+    if (draftOrg && dupCheckedOrg.current !== draftOrg) checkDuplicate(draftOrg)
+  }, [draftOrg, checkDuplicate])
 
   const lookupFor = useCallback(
     (orgNumber: string): Promise<CompanyLookupOutcome> => {
@@ -505,7 +535,6 @@ export default function OnboardingJourney({
         name: periodResult.periodName,
       },
       ticLookup: s.ticLookup,
-      booksGate: mode === 'first',
     })
       .then((result) => {
         timers.forEach((id) => window.clearTimeout(id))
@@ -519,6 +548,7 @@ export default function OnboardingJourney({
           })
           return
         }
+        setRegisteredOffice(result.registeredOffice ?? null)
         dispatch({ type: 'SUBMIT_SUCCEEDED' })
         const initial = (s.settings.company_name || 'A').trim().charAt(0).toUpperCase()
         window.setTimeout(() => setMonogram(initial), reduced ? 0 : 1600)
@@ -613,6 +643,45 @@ export default function OnboardingJourney({
 
   function renderStep() {
     const s = state.settings
+    if (
+      dupMatch &&
+      shouldGateDuplicate({
+        match: dupMatch,
+        orgNumber: s.org_number,
+        acknowledgedOrgNumber: dupAckOrg,
+        step: state.step,
+      })
+    ) {
+      return (
+        <Question
+          title={t('journey_dup_title', { name: dupMatch.name })}
+          sub={t('journey_dup_sub', { appName })}
+          attn={dupSwitchFailed ? t('journey_dup_open_failed') : undefined}
+        >
+          <ChipRow
+            options={[
+              { key: 'open', label: t('journey_dup_open', { name: dupMatch.name }) },
+              { key: 'copy', label: t('journey_dup_copy') },
+            ]}
+            disabled={dupOpening}
+            onPick={(k) => {
+              if (k === 'copy') {
+                setDupAckOrg(dupMatch.orgNumber)
+                return
+              }
+              setDupOpening(true)
+              setDupSwitchFailed(false)
+              performCompanySwitch(dupMatch.companyId).then((result) => {
+                if (result?.error) {
+                  setDupOpening(false)
+                  setDupSwitchFailed(true)
+                }
+              })
+            }}
+          />
+        </Question>
+      )
+    }
     switch (state.step) {
       case 'orgnr':
         return (
@@ -1084,6 +1153,7 @@ export default function OnboardingJourney({
             fyAnswer={fyAnswer}
             momsAnswer={momsAnswer}
             methodAnswer={methodAnswer}
+            registeredOffice={registeredOffice}
             onOpen={() => router.push('/')}
             // Act two (issue #2438): the books, the bank and Skatteverket
             // continue inside the journey chrome under the dashboard layout.
@@ -1402,6 +1472,7 @@ function DoneStep({
   fyAnswer,
   momsAnswer,
   methodAnswer,
+  registeredOffice,
   onOpen,
   onContinue,
 }: {
@@ -1411,6 +1482,8 @@ function DoneStep({
   fyAnswer: string | null
   momsAnswer: string | null
   methodAnswer: string | null
+  /** Säte from the register (SCB Säteskommun); null hides the row. */
+  registeredOffice: string | null
   onOpen: () => void
   onContinue: () => void
 }) {
@@ -1426,7 +1499,7 @@ function DoneStep({
       s.org_number,
     ])
   }
-  if (s.city) rows.push([t('journey_card_seat'), s.city])
+  if (registeredOffice) rows.push([t('journey_card_seat'), registeredOffice])
   if (fyAnswer) rows.push([t('journey_card_fy'), fyAnswer])
   if (s.f_skatt !== undefined) {
     rows.push([t('journey_card_fskatt'), s.f_skatt ? t('journey_card_fskatt_yes') : t('journey_card_fskatt_pending')])

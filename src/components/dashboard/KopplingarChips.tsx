@@ -2,8 +2,9 @@
 
 import { useState, type ReactNode } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
-import { Landmark } from 'lucide-react'
+import { Bot, Landmark } from 'lucide-react'
 import { AiConnectorDialog } from '@/components/onboarding/AiConnectorDialog'
 import {
   DropdownMenu,
@@ -15,7 +16,8 @@ import { ENABLED_EXTENSION_IDS } from '@/lib/extensions/_generated/enabled-exten
 import { useBranding } from '@/lib/branding/brand-context'
 import { useCapability, useCompanyOptional } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
-import { AI_CLIENTS, aiConnectAction, openAiConnector, type AiClient } from '@/lib/onboarding/ai-clients'
+import { AI_CLIENTS, agentChipView, aiConnectAction, openAiConnector, type AiClient, type AiConnection } from '@/lib/onboarding/ai-clients'
+import { useOmbudAppointWithToasts } from '@/components/skatteverket/ombud-appoint'
 
 /**
  * Kopplingar: the three things Att göra can be wired to (an AI agent, the
@@ -28,13 +30,19 @@ import { AI_CLIENTS, aiConnectAction, openAiConnector, type AiClient } from '@/l
  * connect action as a pill like every other control.
  */
 export function KopplingarChips({
-  aiClients,
+  aiConnection,
   hasBank,
   hasSkatteverket,
+  skvOmbudEnabled = false,
 }: {
-  aiClients: AiClient[]
+  aiConnection: AiConnection
   hasBank: boolean
   hasSkatteverket: boolean
+  /**
+   * Accounted can be the company's ombud (system auth on): the pill appoints
+   * it at Skatteverket instead of starting an hourly BankID session.
+   */
+  skvOmbudEnabled?: boolean
 }) {
   const t = useTranslations('dashboard')
   const { appName } = useBranding()
@@ -43,12 +51,21 @@ export function KopplingarChips({
   const skvCapability = useCapability(CAPABILITY.skatteverket)
   const isSandbox = useCompanyOptional()?.isSandbox ?? false
   const [connectAction, setConnectAction] = useState<ReturnType<typeof aiConnectAction> | null>(null)
+  const router = useRouter()
+  const ombud = useOmbudAppointWithToasts((result) => {
+    if (result === 'granted') router.refresh()
+  })
+  const tOmbud = useTranslations('skatteverket_ombud')
 
   // Sandbox companies cannot reach Skatteverket (the sandbox blocks it), and
   // the chip is pointless without the extension or the plan capability.
   const showSkv = skvExtension && skvCapability && !isSandbox
-  const connectedAi = AI_CLIENTS.filter((c) => aiClients.includes(c.id))
-  const aiOn = connectedAi.length > 0
+  // On for any connected agent, named ones or not (agentChipView): an agent
+  // connected through a client we cannot name still reads as connected.
+  const agentChip = agentChipView(aiConnection)
+  const aiOn = agentChip.on
+  const agentLogos = AI_CLIENTS.filter((c) => agentChip.logos.includes(c.id))
+  const agentNames = AI_CLIENTS.filter((c) => agentChip.named.includes(c.id)).map((c) => c.name)
 
   function connect(client: AiClient) {
     const action = aiConnectAction(client, { origin: window.location.origin, appName })
@@ -56,22 +73,24 @@ export function KopplingarChips({
     else openAiConnector(action.open)
   }
 
-  const agentLogos = (aiOn ? connectedAi : AI_CLIENTS)
-
   return (
     <div className="px-1 pt-4 pb-2">
       <AiConnectorDialog action={connectAction} onClose={() => setConnectAction(null)} />
       <ul aria-label={t('kopplingar_title')} className="flex flex-wrap items-center gap-2">
         <Chip
           icon={
-            <span className="flex items-center -space-x-1">
-              {agentLogos.map((c) => (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img key={c.id} src={c.logo} alt="" className="h-4 w-4 rounded-full bg-background ring-1 ring-background" />
-              ))}
-            </span>
+            agentLogos.length > 0 ? (
+              <span className="flex items-center -space-x-1">
+                {agentLogos.map((c) => (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img key={c.id} src={c.logo} alt="" className="h-4 w-4 rounded-full bg-background ring-1 ring-background" />
+                ))}
+              </span>
+            ) : (
+              <Bot className="h-[13px] w-[13px] text-muted-foreground" aria-hidden />
+            )
           }
-          name={aiOn ? connectedAi.map((c) => c.name).join(', ') : t('kopplingar_agent')}
+          name={agentNames.length > 0 ? agentNames.join(', ') : t('kopplingar_agent')}
           status={aiOn ? t('kopplingar_agent_on') : t('kopplingar_agent_off')}
           action={aiOn ? null : (
             <DropdownMenu>
@@ -114,7 +133,18 @@ export function KopplingarChips({
             }
             name={t('kopplingar_skv_short')}
             status={hasSkatteverket ? t('kopplingar_skv_on') : t('kopplingar_skv_off')}
-            action={hasSkatteverket ? null : (
+            action={hasSkatteverket ? null : skvOmbudEnabled ? (
+              <button
+                type="button"
+                onClick={() => void ombud.appoint()}
+                disabled={ombud.linking || ombud.checking}
+                className={pillClass}
+                aria-label={tOmbud('appoint', { appName })}
+                title={tOmbud('appoint_hint', { appName })}
+              >
+                {t('kopplingar_connect')}
+              </button>
+            ) : (
               // eslint-disable-next-line @next/next/no-html-link-for-pages -- /api route, not a Next page; the authorize endpoint 302s to Skatteverket, which the client router cannot follow
               <a
                 href="/api/extensions/ext/skatteverket/authorize?return_to=/"
@@ -132,7 +162,7 @@ export function KopplingarChips({
 }
 
 const pillClass =
-  'inline-flex h-6 items-center rounded-full bg-secondary px-3 text-[11px] text-foreground transition-colors duration-150 hover:bg-secondary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+  'inline-flex h-6 items-center rounded-full bg-secondary px-3 text-[11px] text-foreground transition-colors duration-150 hover:bg-secondary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50'
 
 function Chip({
   icon,

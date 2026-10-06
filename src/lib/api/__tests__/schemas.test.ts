@@ -27,6 +27,9 @@ import {
   CreateInvoiceSchema,
   UpdateInvoiceSchema,
   CreateCreditNoteSchema,
+  InvoicePreviewSchema,
+  InvoiceEmailPreviewSchema,
+  SendInvoiceSchema,
   MarkInvoicePaidSchema,
   CreateRecurringScheduleSchema,
   // Customer schemas
@@ -74,6 +77,7 @@ import {
   PaginationQuerySchema,
   // Employee schemas
   CreateEmployeeSchema,
+  UpdateEmployeeSchema,
 } from '../schemas'
 
 // ============================================================
@@ -306,6 +310,96 @@ describe('CreateInvoiceSchema: ROT/RUT line completeness', () => {
     const { save_as_draft: _s, ...body } = validInvoice({ items: [rutLine({})] }) as Record<string, unknown>
     expect(UpdateInvoiceSchema.safeParse(body).success).toBe(false)
     expect(UpdateInvoiceSchema.safeParse({ ...body, items: [rutLine({ work_type: 'STAD', labor_hours: 1 })] }).success).toBe(true)
+  })
+})
+
+describe('invoice QR mode (one QR code per invoice)', () => {
+  it('lets an invoice choose its QR code, or inherit the company default with null', () => {
+    for (const qr_mode of ['auto', 'bank_app', 'swish', 'payment_link', 'none', null]) {
+      const created = CreateInvoiceSchema.safeParse(validInvoice({ qr_mode }))
+      expect(created.success, String(qr_mode)).toBe(true)
+      expect(created.data?.qr_mode).toBe(qr_mode)
+      expect(UpdateInvoiceSchema.safeParse(validInvoice({ qr_mode })).success, String(qr_mode)).toBe(true)
+    }
+    // Omitted stays omitted: a draft edit without it keeps the stored choice.
+    expect(CreateInvoiceSchema.safeParse(validInvoice()).data).not.toHaveProperty('qr_mode')
+  })
+
+  it('refuses a value that is not a mode', () => {
+    expect(CreateInvoiceSchema.safeParse(validInvoice({ qr_mode: 'all' })).success).toBe(false)
+    expect(UpdateInvoiceSchema.safeParse(validInvoice({ qr_mode: '' })).success).toBe(false)
+  })
+
+  it('lets the company settings choose the default, and keeps accepting the superseded switch', () => {
+    expect(UpdateSettingsSchema.safeParse({ invoice_qr_mode: 'payment_link' }).success).toBe(true)
+    expect(UpdateSettingsSchema.safeParse({ invoice_qr_mode: null }).success).toBe(false)
+    expect(UpdateSettingsSchema.safeParse({ invoice_qr_mode: 'qr' }).success).toBe(false)
+    expect(UpdateSettingsSchema.safeParse({ invoice_show_payment_qr: true }).success).toBe(true)
+  })
+})
+
+// The editor's live preview renders a form that is still being filled in.
+describe('InvoicePreviewSchema', () => {
+  it('accepts a draft with no customer, no rows and empty dates yet', () => {
+    const parsed = InvoicePreviewSchema.safeParse({ customer_id: '', invoice_date: '', qr_mode: '', payment_cash_account_id: '' })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data).toMatchObject({
+      customer_id: null,
+      invoice_date: null,
+      qr_mode: null,
+      payment_cash_account_id: null,
+      items: [],
+    })
+  })
+
+  it('accepts a row being typed: empty description, cleared number fields', () => {
+    const parsed = InvoicePreviewSchema.safeParse({
+      items: [{ description: '', quantity: null, unit: null, unit_price: null, vat_rate: null }],
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data?.items[0]).toMatchObject({ description: '', quantity: 0, unit: '', unit_price: 0 })
+  })
+
+  it('takes every field the write path uses', () => {
+    const parsed = InvoicePreviewSchema.safeParse({
+      delivery_date: '2026-07-01',
+      ore_rounding: false,
+      vat_treatment: 'export',
+      delivery_country: 'no',
+      deduction_apartment_number: '1102',
+      deduction_brf_org_number: '769600-1234',
+      qr_mode: 'swish',
+      payment_cash_account_id: '6f1c2a3e-0000-4000-8000-000000000003',
+      credited_invoice_id: '6f1c2a3e-0000-4000-8000-000000000002',
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data).toMatchObject({ delivery_country: 'NO', vat_treatment: 'export', ore_rounding: false })
+  })
+
+  it.each([
+    ['a string quantity', { items: [{ description: 'x', quantity: '1', unit: 'st', unit_price: 1 }] }],
+    ['an impossible date', { invoice_date: '2026-02-30' }],
+    ['an unknown QR mode', { qr_mode: 'all' }],
+    ['a customer id that is not a uuid', { customer_id: 'customer-1' }],
+    ['a delivery country that is no country', { delivery_country: 'XX' }],
+  ])('refuses %s', (_label, input) => {
+    expect(InvoicePreviewSchema.safeParse(input).success).toBe(false)
+  })
+})
+
+describe('per-send email texts', () => {
+  it('lets a send replace the subject and the message, within limits', () => {
+    expect(SendInvoiceSchema.safeParse({ email_subject: 'Faktura {fakturanummer}', email_body: 'Hej!' }).success).toBe(true)
+    expect(SendInvoiceSchema.safeParse({ email_subject: null, email_body: null }).success).toBe(true)
+    expect(SendInvoiceSchema.safeParse({ email_subject: 'x'.repeat(200) }).success).toBe(true)
+    expect(SendInvoiceSchema.safeParse({ email_subject: 'x'.repeat(201) }).success).toBe(false)
+    expect(SendInvoiceSchema.safeParse({ email_body: 'x'.repeat(5000) }).success).toBe(true)
+    expect(SendInvoiceSchema.safeParse({ email_body: 'x'.repeat(5001) }).success).toBe(false)
+  })
+
+  it('previews the same texts with the draft', () => {
+    expect(InvoiceEmailPreviewSchema.safeParse({ email_subject: 'Hej', items: [] }).success).toBe(true)
+    expect(InvoiceEmailPreviewSchema.safeParse({ email_subject: 'x'.repeat(201) }).success).toBe(false)
   })
 })
 
@@ -3219,6 +3313,112 @@ describe('CreateEmployeeSchema bank details', () => {
   })
 })
 
+// ============================================================
+// Employee update contract (#3008): null clears, an absent key is unchanged
+// ============================================================
+
+describe('UpdateEmployeeSchema clearing optional fields', () => {
+  // Every column that is nullable in the database (and in types Employee).
+  const CLEARABLE = [
+    'employment_end',
+    'monthly_salary',
+    'hourly_rate',
+    'tax_table_number',
+    'tax_municipality',
+    'clearing_number',
+    'bank_account_number',
+    'vacation_pay_rate',
+    'email',
+    'phone',
+    'address_line1',
+    'postal_code',
+    'city',
+    'vaxa_stod_start',
+    'vaxa_stod_end',
+    'jamkning_percentage',
+    'jamkning_valid_from',
+    'jamkning_valid_to',
+  ]
+
+  it.each(CLEARABLE)('accepts null for %s and keeps it in the parsed patch', (field) => {
+    const result = UpdateEmployeeSchema.safeParse({ [field]: null })
+    expect(result.success).toBe(true)
+    if (result.success) expect(result.data).toEqual({ [field]: null })
+  })
+
+  it('accepts null on exactly the nullable columns, nothing else', () => {
+    const acceptsNull = Object.entries(UpdateEmployeeSchema.shape)
+      .filter(([, schema]) => schema.safeParse(null).success)
+      .map(([field]) => field)
+      .sort()
+    expect(acceptsNull).toEqual([...CLEARABLE].sort())
+  })
+
+  it.each([
+    'first_name',
+    'last_name',
+    'employment_type',
+    'employment_start',
+    'employment_degree',
+    'salary_type',
+    'tax_column',
+    'is_sidoinkomst',
+    'f_skatt_status',
+    'vacation_rule',
+    'vaxa_stod_eligible',
+  ])('rejects null for the NOT NULL column %s', (field) => {
+    expect(UpdateEmployeeSchema.safeParse({ [field]: null }).success).toBe(false)
+  })
+
+  it('leaves an absent key absent (no default leaks into a sparse patch)', () => {
+    const result = UpdateEmployeeSchema.safeParse({ first_name: 'Anna' })
+    expect(result.success).toBe(true)
+    if (result.success) expect(result.data).toEqual({ first_name: 'Anna' })
+  })
+
+  it.each(['not-a-date', '2026/06/30', '30-06-2026', ''])('still rejects a malformed employment_end %j', (value) => {
+    expect(UpdateEmployeeSchema.safeParse({ employment_end: value }).success).toBe(false)
+  })
+
+  it('still accepts a well-formed employment_end', () => {
+    expect(UpdateEmployeeSchema.safeParse({ employment_end: '2026-06-30' }).success).toBe(true)
+  })
+
+  it('treats a null salary as missing when the patch switches salary type', () => {
+    const result = UpdateEmployeeSchema.safeParse({ salary_type: 'monthly', monthly_salary: null })
+    expect(result.success).toBe(false)
+    if (!result.success) expect(result.error.issues[0].path).toEqual(['monthly_salary'])
+  })
+
+  it('refuses enabling Växa-stöd while clearing its start date in the same body', () => {
+    const result = UpdateEmployeeSchema.safeParse({ vaxa_stod_eligible: true, vaxa_stod_start: null })
+    expect(result.success).toBe(false)
+    if (!result.success) expect(result.error.issues[0].path).toEqual(['vaxa_stod_start'])
+  })
+
+  it('keeps the end-before-start refinements working next to a null date', () => {
+    expect(UpdateEmployeeSchema.safeParse({ vaxa_stod_start: '2026-06-01', vaxa_stod_end: null }).success).toBe(true)
+    expect(UpdateEmployeeSchema.safeParse({ vaxa_stod_start: '2026-06-01', vaxa_stod_end: '2026-01-01' }).success).toBe(false)
+    expect(UpdateEmployeeSchema.safeParse({ jamkning_valid_from: '2026-06-01', jamkning_valid_to: null }).success).toBe(true)
+    expect(UpdateEmployeeSchema.safeParse({ jamkning_valid_from: '2026-06-01', jamkning_valid_to: '2026-01-01' }).success).toBe(false)
+  })
+
+  it('leaves the create schema optional-only: null is not a create value', () => {
+    const result = CreateEmployeeSchema.safeParse({
+      first_name: 'Anna',
+      last_name: 'Andersson',
+      personnummer: '199001011234',
+      employment_start: '2026-01-01',
+      employment_end: null,
+      monthly_salary: 30000,
+      tax_table_number: 33,
+      tax_municipality: 'Stockholm',
+    })
+    expect(result.success).toBe(false)
+    if (!result.success) expect(result.error.issues.some((i) => i.path[0] === 'employment_end')).toBe(true)
+  })
+})
+
 describe('CreateRecurringScheduleSchema send_hour', () => {
   const base = {
     customer_id: '550e8400-e29b-41d4-a716-446655440000',
@@ -3352,5 +3552,26 @@ describe('salary calculation policy and engångsskatt shapes', () => {
     expect(Schema.safeParse({ ...base, one_off_tax_percent: 100.5 }).success).toBe(false)
     expect(Schema.safeParse({ ...base, one_off_tax_percent: -1 }).success).toBe(false)
     expect(Patch.safeParse({ one_off_tax_percent: null }).success).toBe(true)
+  })
+})
+
+describe('CreateJournalEntryLineSchema: cost_center/project aliases follow the bag value rule', () => {
+  const line = (extra: Record<string, unknown>) => ({ account_number: '5010', debit_amount: 100, credit_amount: 0, ...extra })
+
+  it('accepts a normal alias and trims it, like the bag it lands in', () => {
+    const result = CreateJournalEntryLineSchema.safeParse(line({ cost_center: '  KS01 ', project: 'P100' }))
+    expect(result.success).toBe(true)
+    expect(result.data).toMatchObject({ cost_center: 'KS01', project: 'P100' })
+  })
+
+  it('still accepts a blank alias, which means untagged', () => {
+    expect(CreateJournalEntryLineSchema.safeParse(line({ cost_center: '', project: '   ' })).success).toBe(true)
+  })
+
+  it('refuses an alias the jel_dimensions_well_formed CHECK would refuse, as a validation error', () => {
+    for (const bad of [{ cost_center: 'K'.repeat(41) }, { project: 'P"1' }, { project: 'P{1}' }]) {
+      const result = CreateJournalEntryLineSchema.safeParse(line(bad))
+      expect(result.success).toBe(false)
+    }
   })
 })

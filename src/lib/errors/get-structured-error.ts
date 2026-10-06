@@ -15,9 +15,13 @@
  * REST envelope so a single registry covers every entry point.
  */
 import { NextResponse } from 'next/server'
+import { userFacingCode } from './user-facing'
 import { ZodError } from 'zod'
 import { getErrorMessage } from './get-error-message'
+import { foreignKeyRefusal } from './foreign-key-refusal'
+import { fieldValidationError, zodErrorFieldIssues } from './refusal'
 import {
+  conflictCode,
   getErrorEntry,
   type StructuredErrorEntry,
   type StructuredErrorRemediation,
@@ -26,6 +30,7 @@ import {
   AccountsNotInChartError,
   BookkeepingDatabaseError,
   CannotCancelNonDraftError,
+  CannotEditNonDraftError,
   CannotCorrectNonPostedError,
   CannotReverseNonPostedError,
   CannotReverseStornoError,
@@ -40,6 +45,7 @@ import {
   JournalLineBothSidesNonZeroError,
   JournalLineNegativeAmountError,
   CurrencyRevaluationAlreadyExistsError,
+  MandatoryDimensionMissingError,
   MeaninglessCorrectionError,
   NoOpenPeriodForDateError,
   TargetPeriodClosedError,
@@ -132,7 +138,7 @@ function extractCode(error: unknown): string | null {
 
   // Application conflicts use PT409 so PostgREST does not retry them as
   // serialization failures. Callers must refresh stale inputs first.
-  if (obj.code === 'PT409') return 'CONFLICT'
+  if (obj.code === 'PT409') return conflictCode(obj.message)
 
   // Typed bookkeeping error: { code: 'JOURNAL_ENTRY_NOT_BALANCED', ... }
   if (typeof obj.code === 'string' && /^[A-Z_]+$/.test(obj.code)) {
@@ -142,7 +148,7 @@ function extractCode(error: unknown): string | null {
   // Wrapped error: { error: { code: '...' } }
   if (typeof obj.error === 'object' && obj.error !== null) {
     const inner = obj.error as Record<string, unknown>
-    if (inner.code === 'PT409') return 'CONFLICT'
+    if (inner.code === 'PT409') return conflictCode(inner.message)
     if (typeof inner.code === 'string' && /^[A-Z_]+$/.test(inner.code)) {
       return inner.code
     }
@@ -252,6 +258,29 @@ export function getStructuredError(
     }
   }
 
+  // A delete the database refused because other rows still point at the row.
+  // Before #2831 an agent got UNKNOWN_ERROR and the raw Postgres sentence;
+  // now it gets a code to branch on, English it can act on and the way back.
+  const refusal = foreignKeyRefusal(error)
+  if (refusal) {
+    return {
+      code: refusal.code,
+      message_sv: refusal.message_sv ?? getErrorMessage(error),
+      message_en: refusal.message_en,
+      remediation: refusal.remediation,
+      retryable: false,
+    }
+  }
+
+  // A Zod `.parse()` that threw past its call site. errorResponse below has
+  // always answered VALIDATION_ERROR for it; this door answered UNKNOWN_ERROR
+  // with the issue list as raw JSON (create_skill, set_inbox_extracted_data).
+  // A parse of data the server built itself is a server bug, not a caller
+  // mistake: such a site must catch its own failure and throw INTERNAL_ERROR.
+  if (isZodError(error) && Array.isArray(error.issues) && error.issues.length > 0) {
+    return getStructuredError(fieldValidationError('Invalid arguments', zodErrorFieldIssues(error)), options)
+  }
+
   const message_en = extractEnglishMessage(error)
   const message_sv = getErrorMessage(error)
 
@@ -268,10 +297,16 @@ export function getStructuredError(
   let remediation = extractRemediation(error) ?? entry?.remediation
 
   // Specialize INSUFFICIENT_SCOPE with the actual scope name when known.
+  // Approve gets its own hint: it is never pre-ticked on the MCP consent page
+  // (founder decision 2026-10-03, issue #3408), so a default connection lacks
+  // it, and the way forward is the review list in the app, or reconnecting
+  // with it ticked (scopes cannot be added to an existing key).
   if (code === 'INSUFFICIENT_SCOPE' && options.attemptedScope && remediation) {
     remediation = {
       ...remediation,
-      description: `The current API key does not have the "${options.attemptedScope}" scope. Mint a new key with that scope or add it to the existing key in API settings.`,
+      description: options.attemptedScope === 'pending_operations:approve'
+        ? 'This connection cannot approve or reject agent proposals: it was made without the "pending_operations:approve" scope (Godkänn). The user approves or rejects them in Accounted under Att göra > Agentförslag (/pending). To let the agent approve in chat, the user disconnects under Inställningar > API och MCP and connects again with Godkänn ticked.'
+        : `The current API key does not have the "${options.attemptedScope}" scope. Mint a new key with that scope or add it to the existing key in API settings.`,
     }
   }
 
@@ -436,9 +471,39 @@ export function errorResponse(
 
   // 3. Postgres errors
   if (isPostgresError(err)) {
+    // A refused delete gets its own code, sentence and remediation instead of
+    // the generic VALIDATION_ERROR (#2831). details names the referencing
+    // table so an API client knows what still holds the row.
+    const refusal = foreignKeyRefusal(err)
+    if (refusal) {
+      const entry = entryFor(refusal.code)
+      logAtLevel(log, entry.httpStatus, 'refused delete', err as unknown as Error, {
+        requestId: ctx.requestId,
+        pgCode: err.code,
+      })
+      const details = mergeDetails(
+        {
+          pgCode: err.code,
+          ...(refusal.referencedBy ? { referenced_by: refusal.referencedBy } : {}),
+          ...(refusal.register ? { register: refusal.register } : {}),
+        },
+        ctx.details,
+      )
+      return buildResponse(
+        refusal.code,
+        {
+          ...entry,
+          message_sv: refusal.message_sv ?? entry.message_sv,
+          message_en: refusal.message_en,
+          remediation: refusal.remediation,
+        },
+        ctx.requestId,
+        details,
+      )
+    }
     const mapped = isIgnoredTransactionJournalConstraint(err)
       ? 'TX_CATEGORIZE_IGNORED_CONFLICT'
-      : postgresCodeToStructured(err.code)
+      : err.code === 'PT409' ? conflictCode(err.message) : postgresCodeToStructured(err.code)
     if (mapped) {
       const entry = entryFor(mapped)
       logAtLevel(log, entry.httpStatus, 'database error', err as unknown as Error, {
@@ -452,6 +517,26 @@ export function errorResponse(
       requestId: ctx.requestId,
       pgCode: err.code,
     })
+  }
+
+  // 3b. Errors written for the reader. Before the registry lookup, because the
+  //     point is to keep the sentence the author wrote instead of the canned
+  //     one the code maps to: a paused import and a klarmarkerat räkenskapsår
+  //     both name the setting to change, and both arrived as generic text.
+  //     Swedish in both locales, like the engine's other domain errors.
+  const spoken = userFacingCode(err)
+  if (spoken && getErrorEntry(spoken)) {
+    const entry = entryFor(spoken)
+    const status = ctx.status ?? entry.httpStatus
+    const message = (err as Error).message
+    logAtLevel(log, status, spoken, err as Error, { requestId: ctx.requestId })
+    return buildResponse(
+      spoken,
+      { ...entry, httpStatus: status, message_sv: message, message_en: message },
+      ctx.requestId,
+      ctx.details,
+      true,
+    )
   }
 
   // 4. Errors with a known structured code on them
@@ -532,6 +617,11 @@ function extractBookkeepingDetails(err: unknown): { code: string; details?: unkn
   if (err instanceof CannotCancelNonDraftError) {
     return { code: err.code, details: { currentStatus: err.currentStatus } }
   }
+  // Without this arm a draft edit of a posted entry fell through to the
+  // INTERNAL_ERROR default (500) instead of the registry's 409.
+  if (err instanceof CannotEditNonDraftError) {
+    return { code: err.code, details: { currentStatus: err.currentStatus } }
+  }
   if (err instanceof EntryAlreadyReversedError) return { code: err.code }
   if (err instanceof CurrencyRevaluationAlreadyExistsError) return { code: err.code }
   if (err instanceof InvalidMappingResultError) {
@@ -551,6 +641,12 @@ function extractBookkeepingDetails(err: unknown): { code: string; details?: unkn
   }
   if (err instanceof DimensionValidationError) {
     return { code: err.code, details: { issues: err.issues } }
+  }
+  // Without this arm a required-dimension refusal (account_dimension_rules)
+  // fell through to the INTERNAL_ERROR default: a 500 that never said which
+  // account needs which dimension, so the user could not fix the tag.
+  if (err instanceof MandatoryDimensionMissingError) {
+    return { code: err.code, details: { violations: err.violations } }
   }
   if (err instanceof NoOpenPeriodForDateError) {
     return { code: err.code, details: { date: err.date } }
@@ -572,6 +668,13 @@ function buildResponse(
   entry: StructuredErrorEntry,
   requestId: string | undefined,
   details: unknown,
+  /**
+   * The messages on `entry` were written for THIS failure rather than looked up
+   * from the registry, so nothing may replace them. Explicit rather than
+   * inferred: comparing against the registry entry would also silently swallow
+   * an authored sentence that happens to read like the canned one.
+   */
+  authoredMessage = false,
 ): NextResponse {
   const body: ErrorEnvelope = {
     error: {
@@ -585,7 +688,15 @@ function buildResponse(
   }
   // Consumers that read only error.message need the same actionable summary
   // as the app. Keep the full issues array and stable code for API clients.
-  if (code === 'VALIDATION_ERROR' && Array.isArray((details as { issues?: unknown } | undefined)?.issues)) {
+  //
+  // Never over an authored message. This branch rewrites both locales from the
+  // issue list, and an error marked user-facing arrives here with the sentence
+  // its author wrote in exactly those fields: a VALIDATION_ERROR carrying
+  // `details.issues` would have had that sentence replaced by a field summary,
+  // which is the single thing this whole path exists to prevent. Not reachable
+  // today (no marked error populates `issues`), and guarded rather than left to
+  // the next caller that pairs the two.
+  if (!authoredMessage && code === 'VALIDATION_ERROR' && Array.isArray((details as { issues?: unknown } | undefined)?.issues)) {
     body.error.message = getErrorMessage(body, { locale: 'sv' })
     body.error.message_en = getErrorMessage(body, { locale: 'en' })
   }
@@ -617,5 +728,6 @@ export function errorResponseFromCode(
     },
     ctx.requestId,
     ctx.details,
+    Boolean(ctx.messageSv || ctx.messageEn),
   )
 }

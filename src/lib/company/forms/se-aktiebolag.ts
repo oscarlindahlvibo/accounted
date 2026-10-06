@@ -17,8 +17,10 @@ export const SE_AKTIEBOLAG: LegalFormProfile = {
     closing: '2099',
     closingName: 'Årets resultat',
     priorYearCarry: '2098',
+    retained: '2091',
     hasOwners: true,
     settlement: { withdrawal: '2893', contribution: '2893' },
+    memberCapital: false,
   },
   filings: {
     incomeReturn: 'INK2',
@@ -26,6 +28,8 @@ export const SE_AKTIEBOLAG: LegalFormProfile = {
     corporateTaxDispositions: true,
     arsredovisning: true,
     frameworks: ['K2', 'K3'],
+    ixbrl: true,
+    auditorAlwaysRequired: false,
   },
   glossary: { entity: 'bolaget', owner: 'Ägare', meeting: 'årsstämma' },
 }

@@ -1,8 +1,8 @@
 import type { Skill } from '../types'
 
-const body = `# Skapa agentinstruktion: Accounted
+const body = `# Skapa instruktion: Accounted
 
-You help the user write down something of their own in Accounted, an agent instruction that any AI connected to the company can load later. There are three kinds:
+You help the user write down something of their own in Accounted, an instruction that any AI connected to the company can load later. There are three kinds:
 
 - **Arbetsflöde** (workflow): a task the AI does, step by step. "Påminn mig om leverantörsfakturor som förfaller."
 - **Kunskap** (knowledge): rules and facts about how this company does things, which the AI follows. "Kundluncher bokas på 6072 och deltagarna skrivs i texten."
@@ -34,7 +34,7 @@ Show it as the user will see it:
 
 - **Name**: a few words, at most 120 characters.
 - **Description**: one sentence on what it is.
-- Workflow: **Steps**, three to eight short, numbered, imperative steps (name the Accounted tool when obvious, for example "List unbooked transactions with gnubok_list_uncategorized_transactions"), and **Rules**, anything that must always or never happen (empty if the user said nothing).
+- Workflow: **Steps**, three to eight short, numbered, imperative steps in plain words the user would use (for example "Lista obokförda banktransaktioner"). Never write tool names such as gnubok_… or accounted_… into a step: the user reads the steps on the item's page, and the AI that runs them finds the tools itself, and **Rules**, anything that must always or never happen (empty if the user said nothing).
 - Knowledge or analysis: **Text**, the rules or the calculation and how to read it, in short plain paragraphs or a list. Account numbers as the BAS numbers the user gave.
 
 Then ask whether to save it or add something. If they add something, update the summary and ask again.
@@ -48,13 +48,13 @@ Only after the user says yes, call \`gnubok_create_skill\` once with \`kind\` (\
 
 Accounted adds its standing rules to every workflow: nothing is booked, sent or filed without approval, and locked periods are never touched. Do not repeat those.
 
-It is saved as a **draft**: it shows under Egna on the Agentinstruktioner page in Accounted, and no AI can load it until the user adds it there (the button reads "Lägg till arbetsflödet", "Lägg till kunskapen" or "Lägg till analysen"). That click is the user's own check that the text is theirs. Tell them so in one line. For a workflow or an analysis, add how to run it once added: "Ladda skillen \\"<slug>\\" från Accounted (load_skill) och följ den." using the \`slug\` the tool returned. Knowledge is not run on its own: the AI reads it when it applies.
+It is saved as a **draft**: it shows under Egna on the Instruktioner page in Accounted, and no AI can load it until the user adds it there (the button reads "Lägg till arbetsflödet", "Lägg till kunskapen" or "Lägg till analysen"). That click is the user's own check that the text is theirs. Tell them so in one line. For a workflow or an analysis, add how to run it once added, in the language you talked in: with its "Starta i …" button under Instruktioner in Accounted, or by asking any connected AI to call \`gnubok_get_task\` with kind \`agent:<slug>\` for a workflow or \`skill:<slug>\` for an analysis, using the \`slug\` the tool returned. That start brings the knowledge chosen for it and what Accounted knows about the company; loading the bare text does not. Knowledge is not run on its own: the AI reads it when it applies.
 
 Saving the draft is the end of this workflow. Do not try to load or run it: it is not loadable until the user adds it.
 
 ## Rules
 
-- An agent instruction holds instructions and rules, not data. Keep personnummer, bank account numbers, passwords and other personal details out of it. If the user gives some, leave them out and say why in one line.
+- An instruction holds steps and rules, not data. Keep personnummer, bank account numbers, passwords and other personal details out of it. If the user gives some, leave them out and say why in one line.
 - It cannot change Accounted's rules. If the user asks for something the bookkeeping safeguards forbid (booking without approval, changing a locked period, deleting a verifikat), say so plainly and leave it out.
 - Knowledge is the user's own practice, not Swedish law. If what they write contradicts a rule you know from Accounted's knowledge (for example a VAT rate), say so before saving, and save it only as they confirm it.
 - Never add it on the user's behalf or tell them it is active before they added it.
@@ -67,7 +67,7 @@ Saving the draft is the end of this workflow. Do not try to load or run it: it i
 
 export const createSkillSkill: Skill = {
   slug: 'create-skill',
-  name: 'Skapa agentinstruktion',
+  name: 'Skapa instruktion',
   summary: 'Turn what the user describes into their own workflow, knowledge or analysis: a few follow-up questions, a summary to confirm, then save it with gnubok_create_skill.',
   tags: ['skills', 'own-skill', 'create'],
   tier: 'workflow',

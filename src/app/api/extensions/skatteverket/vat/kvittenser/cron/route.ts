@@ -3,11 +3,11 @@ import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { verifyCronSecret } from '@/lib/auth/cron'
 import { skvRequestWithAuth, SkatteverketAuthError } from '@/extensions/general/skatteverket/lib/api-client'
+import { auditUserIdFor } from '@/extensions/general/skatteverket/lib/audit'
 import { markNeedsReconsent, RECONSENT_ERROR_CODES } from '@/extensions/general/skatteverket/lib/token-store'
 import { sendKvittensNotification } from '@/extensions/general/skatteverket/lib/kvittens-notification'
 import { resolveReadAuth, currentSkvEnvironment, findCompanyTokenUser } from '@/extensions/general/skatteverket/lib/resolve-auth'
 import { markGrantRevoked } from '@/extensions/general/skatteverket/lib/connection-store'
-import { completeTaxDeadline } from '@/lib/deadlines/complete-tax-deadline'
 import { recordVatFilingConfirmed } from '@/lib/vat/filing-record-store'
 import { hasCapability } from '@/lib/entitlements/has-capability'
 import { CAPABILITY } from '@/lib/entitlements/keys'
@@ -138,7 +138,17 @@ export async function GET(request: Request) {
       const response = await skvRequestWithAuth(
         resolved.auth,
         'GET',
-        `/inlamnat/${state.redovisare}/${period}`
+        `/inlamnat/${state.redovisare}/${period}`,
+        {
+          endpoint: 'inlamnat',
+          companyId,
+          // Nobody asked: the token owner on a personal token, null on
+          // system credentials. Never a stand-in user.
+          userId: auditUserIdFor(resolved.auth),
+          agRegistreradId: state.redovisare ?? null,
+          redovisningsperiod: period,
+          okStatuses: [404],
+        }
       )
 
       if (response.status === 404) {
@@ -192,38 +202,34 @@ export async function GET(request: Request) {
 
       // Record the filing on the period's moms deadline. Only possible when
       // the state carries the picker params (written by the one-click chain;
-      // states persisted by the older step-by-step routes lack them).
-      if (state.periodType === 'monthly' || state.periodType === 'quarterly') {
-        if (state.year && state.period) {
-          // Creates the deadline row when the company has none for the
-          // period (it predates the generator's window): a bare update would
-          // leave no filing record and the VAT page would reopen the period.
-          try {
-            await recordVatFilingConfirmed(supabase, companyId, {
-              periodType: state.periodType,
-              year: state.year,
-              period: state.period,
-            })
-          } catch (recordError) {
-            console.error('[vat-kvittenser-cron] Failed to record filing on the moms deadline', {
-              companyId,
-              period,
-              message: recordError instanceof Error ? recordError.message : String(recordError),
-            })
-          }
+      // states persisted by the older step-by-step routes lack them). One
+      // path for every cadence: the store places a yearly period (year = the
+      // year the räkenskapsår ends) from the company's fiscal-year settings.
+      if (
+        (state.periodType === 'monthly' ||
+          state.periodType === 'quarterly' ||
+          state.periodType === 'yearly') &&
+        state.year &&
+        state.period
+      ) {
+        // Creates the deadline row when the company has none for the
+        // period (it predates the generator's window): a bare update would
+        // leave no filing record and the VAT page would reopen the period.
+        try {
+          await recordVatFilingConfirmed(supabase, companyId, {
+            periodType: state.periodType,
+            year: Number(state.year),
+            // A yearly period is always 1 in the key; the stored state's
+            // period was never read for it, so it is not trusted now either.
+            period: state.periodType === 'yearly' ? 1 : Number(state.period),
+          })
+        } catch (recordError) {
+          console.error('[vat-kvittenser-cron] Failed to record filing on the moms deadline', {
+            companyId,
+            period,
+            message: recordError instanceof Error ? recordError.message : String(recordError),
+          })
         }
-      } else if (state.periodType === 'yearly' && state.year && state.period) {
-        // moms_yearly rows carry the generator's fiscal-year label:
-        // `YYYY` for calendar FYs, `YYYY-1/YYYY` for broken ones.
-        const { data: fySettings } = await supabase
-          .from('company_settings')
-          .select('fiscal_year_start_month')
-          .eq('company_id', companyId)
-          .maybeSingle()
-        const startMonth = fySettings?.fiscal_year_start_month ?? 1
-        const yearNum = Number(state.year)
-        const taxPeriod = startMonth === 1 ? `${yearNum}` : `${yearNum - 1}/${yearNum}`
-        await completeTaxDeadline(supabase, companyId, ['moms_yearly'], taxPeriod, 'confirmed')
       }
 
       if (resolved.tokenUserId) {

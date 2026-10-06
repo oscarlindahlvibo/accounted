@@ -43,8 +43,7 @@ import {
   type BookedDuplicateCandidate,
   type BookingDuplicateExclusions,
 } from '@/lib/transactions/booking-duplicate-detection'
-import { hasLiveJournalEntryLink } from '@/lib/transactions/link-journal-entry'
-import { hasBankLineJunctionRow } from '@/lib/transactions/is-booked'
+import { assertTransactionBookable } from '@/lib/transactions/is-booked'
 import { propagateUnderlagForBookedTransaction } from '@/lib/transactions/inbox-underlag'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { createLogger } from '@/lib/logger'
@@ -52,6 +51,7 @@ import { getStructuredError } from '@/lib/errors/get-structured-error'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
 import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
 import type { InboxChannelContext, Transaction, TransactionCategory, EntityType, VatTreatment } from '@/types'
+import type { ReverseChargeKind } from '@/lib/bookkeeping/vat-entries'
 
 const log = createLogger('transactions/categorize-core')
 
@@ -71,6 +71,11 @@ export interface CategorizeCoreResult {
 export interface CategorizeMatchedTransactionOpts {
   category: TransactionCategory
   vatTreatment?: VatTreatment
+  /**
+   * Basis box of a reverse-charge purchase (ruta 20/21/22). Omitted = EU
+   * services, see buildMappingResultFromCategory.
+   */
+  reverseChargeKind?: ReverseChargeKind
   /**
    * The underlag's actual VAT when it differs from rate × belopp (e.g. dricks).
    * Only valid with a rate-based vat_treatment; see buildMappingResultFromCategory.
@@ -248,13 +253,13 @@ export async function categorizeMatchedTransaction(
    */
   exclude?: BookingDuplicateExclusions,
 ): Promise<CategorizeCoreResult> {
-  const { category, vatTreatment, vatAmount, notes, allowDuplicate, dimensions, accountOverride } = opts
+  const { category, vatTreatment, reverseChargeKind, vatAmount, notes, allowDuplicate, dimensions, accountOverride } = opts
 
   // The junction rows ride along on the same read: a row bulk-booked into a
   // samlingsverifikat or split over several verifikat (1:N, #1553) carries
   // journal_entry_id = NULL, and the pointer alone would let it be booked a
-  // second time. Only 'bank_line' rows count (hasBankLineJunctionRow): a
-  // residual's 'other' row left behind by a storno must stay re-bookable.
+  // second time. Only 'bank_line' rows count: a residual's 'other' row left
+  // behind by a storno must stay re-bookable.
   const { data: transactionRow, error: fetchError } = await supabase
     .from('transactions')
     .select('*, transaction_voucher_links(journal_entry_id, role)')
@@ -266,20 +271,21 @@ export async function categorizeMatchedTransaction(
     return { error: 'Transaction not found: it may have been deleted.', status: 404 }
   }
   const { transaction_voucher_links: junctionLinks, ...transaction } = transactionRow
-  if (hasBankLineJunctionRow(junctionLinks)) {
-    return { error: 'Transaction already has a journal entry: it was categorized in the meantime.', status: 409 }
-  }
-  // A stale pointer at a 'reversed' entry (storno/correction left it behind)
-  // must not block re-categorization: the row reads as "utan koppling" in the
-  // UI, so a fresh booking has to be allowed (issue #988). Only a live posted
-  // link means it was genuinely categorized in the meantime. The UPDATE below
-  // uses the observed stale pointer as its CAS value, so it only replaces the
-  // pointer if no concurrent request changed it. The duplicate guard still
-  // catches an existing live correction and steers the user to link instead.
-  if (
-    transaction.journal_entry_id &&
-    (await hasLiveJournalEntryLink(supabase, companyId, transaction.journal_entry_id))
-  ) {
+  // One shared answer with the HTTP booking doors (assertTransactionBookable):
+  // booked when the pointer or a bank_line link names a posted verifikat. A
+  // stale pointer or link at a 'reversed' entry (storno/correction left it
+  // behind) must not block re-categorization: the row reads as "utan
+  // koppling" in the UI, so a fresh booking has to be allowed (issue #988).
+  // The UPDATE below uses the observed stale pointer as its CAS value, so it
+  // only replaces the pointer if no concurrent request changed it. The
+  // duplicate guard still catches an existing live correction and steers the
+  // user to link instead.
+  const bookable = await assertTransactionBookable(supabase, companyId, {
+    id: txId,
+    journal_entry_id: transaction.journal_entry_id ?? null,
+    transaction_voucher_links: Array.isArray(junctionLinks) ? junctionLinks : [],
+  })
+  if (!bookable.ok) {
     return { error: 'Transaction already has a journal entry: it was categorized in the meantime.', status: 409 }
   }
 
@@ -386,7 +392,7 @@ export async function categorizeMatchedTransaction(
   // (lib/bookkeeping/vat-registration.ts); the flag is passed as loaded.
   let mappingResult = buildMappingResultFromCategory(
     category, transaction as Transaction, isBusiness, entityType, vatTreatment, vatAmount,
-    settings?.vat_registered ?? null,
+    settings?.vat_registered ?? null, reverseChargeKind,
   )
   const settlementAccount = await resolveSettlementAccount(
     supabase,

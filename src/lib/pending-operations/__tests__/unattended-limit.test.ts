@@ -139,3 +139,35 @@ describe('exceedsUnattendedLimit', () => {
     expect(result.attempted).toBe(10_000_000)
   })
 })
+
+describe('priceOperation: operation-registry writes that move money', () => {
+  it('reads a nested preview field by dotted path (a booking verifikat)', () => {
+    expect(priceOperation('book_invoice', { journal_entry: { total_debit: 12500 } })).toBe(12500)
+    expect(priceOperation('book_supplier_invoice', { journal_entry: { total_debit: 800 } })).toBe(800)
+  })
+
+  it('prices a payment file, a bulk booking and utlägg by their totals', () => {
+    expect(priceOperation('create_supplier_payment_batch', { total_amount: 45000 })).toBe(45000)
+    expect(priceOperation('bulk_book_invoices', { total_debit: 90000 })).toBe(90000)
+    expect(priceOperation('create_expense_claim', { amount_sek: 350 })).toBe(350)
+    expect(priceOperation('record_expense_payout', { total_sek: 1200 })).toBe(1200)
+    expect(priceOperation('match_expense_payout', { total_sek: 1200 })).toBe(1200)
+  })
+
+  it('stays unpriced (not enforced) when the nested path is missing', () => {
+    expect(priceOperation('book_invoice', { journal_entry: null })).toBeNull()
+  })
+
+  it('prices the IB split per project like the inline rättelse it is (#3313)', () => {
+    expect(priceOperation('split_opening_balances_per_project', { changed_amount_sek: 182500 })).toBe(182500)
+    expect(priceOperation('correct_entry_lines_inline', { changed_amount_sek: 182500 })).toBe(182500)
+    expect(
+      exceedsUnattendedLimit({
+        actorType: 'api_key',
+        limit: 10000,
+        operationType: 'split_opening_balances_per_project',
+        previewData: { changed_amount_sek: 182500 },
+      }),
+    ).toEqual({ exceeded: true, attempted: 182500, limit: 10000 })
+  })
+})

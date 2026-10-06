@@ -449,6 +449,27 @@ describe('skatteverket OAuth callback', () => {
       expect(html).toContain(JSON.stringify(`${BRAND}/settings/tax?skv_error=exchange%20boom`))
       expect(mockRefresh).not.toHaveBeenCalled()
     })
+
+    it('logs a failed exchange through the redacting logger, scoped to the company, without a personnummer the SKV body echoes', async () => {
+      handoffIs(handoffOn(BRAND))
+      mockExchange.mockRejectedValueOnce(
+        new Error('Skatteverket token exchange failed (400): {"error":"invalid_grant","subject":"191212121212"}'),
+      )
+
+      await callbackRoute().handler(callbackRequest(BRAND, `handoff=${HANDOFF}`))
+
+      const logged = vi
+        .mocked(console.error)
+        .mock.calls.flat()
+        // JSON.stringify(new Error(...)) is "{}": spell an Error out so a raw one is caught.
+        .map((arg) =>
+          typeof arg === 'string' ? arg : arg instanceof Error ? `${arg.message}\n${arg.stack ?? ''}` : JSON.stringify(arg),
+        )
+        .join('\n')
+      expect(logged).toContain('[skatteverket] ERROR token exchange failed')
+      expect(logged).toContain('companyId="company-1"')
+      expect(logged).not.toContain('191212121212')
+    })
   })
 
   describe('single hop when the callback host is the app host (self-hosted)', () => {
@@ -470,6 +491,25 @@ describe('skatteverket OAuth callback', () => {
         'verifier-1',
         undefined,
       )
+    })
+
+    it("carries the proxy's nonce on the popup script and in its own CSP", async () => {
+      // A self-hosted `next start` delivers only the proxy's CSP header
+      // (src/proxy.ts): the script must carry the nonce that header trusts.
+      stateIs(flowOn(APP, { redirectUri: `${APP}/api/extensions/ext/skatteverket/callback` }))
+      const proxyNonce = 'cHJveHktbm9uY2UtMTIzNDU2Nzg='
+      const request = new Request(callbackRequest(APP, `code=abc&state=${STATE}`).url, {
+        headers: { 'x-nonce': proxyNonce },
+      })
+
+      const response = await callbackRoute().handler(request)
+
+      expect(response.headers.get('content-security-policy')).toContain(
+        `script-src 'nonce-${proxyNonce}'`,
+      )
+      const html = await response.text()
+      expect(html).toContain(`<script nonce="${proxyNonce}">`)
+      expect(html).toContain('skatteverket-oauth-success')
     })
 
     it('shows the provider denial directly', async () => {

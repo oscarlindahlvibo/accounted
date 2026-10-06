@@ -17,10 +17,10 @@ vi.mock('@/lib/supabase/server', () => ({
  *   - company_settings (entity_type + vat_registered, used by applicability filter)
  *   - employees (active count, used by applicability filter)
  *
- *  All test queries resolve to the same defaults: entity_type='AB',
- *  vat_registered=true, 1 active employee: so every applicability-filtered
- *  skill is included by default. Individual tests can override via the
- *  optional overrides parameter.
+ *  All test queries resolve to the same defaults: entity_type='aktiebolag'
+ *  (the stored form, never the skill tag 'AB'), vat_registered=true, 1 active
+ *  employee: so every applicability-filtered skill is included by default.
+ *  Individual tests can override via the optional overrides parameter.
  */
 function makeSupabaseWithEmptyAtomRegistry(
   rows: unknown[] = [],
@@ -28,7 +28,7 @@ function makeSupabaseWithEmptyAtomRegistry(
   refRow: unknown = null,
   companySkillRows: unknown[] = [],
 ) {
-  const entityType = overrides.entityType ?? 'AB'
+  const entityType = overrides.entityType ?? 'aktiebolag'
   const vatRegistered = overrides.vatRegistered ?? true
   const employeeCount = overrides.employeeCount ?? 1
 
@@ -122,7 +122,7 @@ describe('private skill discovery through the dispatcher', () => {
     const row = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', name: 'Private workflow', description: 'Company-specific instructions', body: 'Private instructions.', share_status: 'private', atom_id: null, company_id: 'company-1', team_id: null }
     const db = makeSupabaseWithEmptyAtomRegistry([], {}, null, [row])
     vi.mocked(createServiceClientNoCookies).mockReturnValueOnce(db as never)
-    vi.mocked(validateApiKey).mockResolvedValueOnce({ userId: 'user-1', companyId: 'company-1', scopes: allowed ? ['agent:read'] : [], mode: 'live', unattendedCommitLimit: null })
+    vi.mocked(validateApiKey).mockResolvedValueOnce({ userId: 'user-1', companyId: 'company-1', scopes: allowed ? ['agent:read'] : [], mode: 'live', unattendedCommitLimit: null, allowedCompanyIds: null, readOnlyCompanyIds: null })
     const result = await parseResult(await handleMcpRequest(mcpRequest('tools/call', { name: 'accounted_list_skills', arguments: {} })))
     expect(result.isError).not.toBe(true)
     const skills = JSON.parse(result.content[0].text).skills as { slug: string }[]
@@ -197,9 +197,9 @@ describe('Skills registry', () => {
       // Legal: the v1 :send/:mark-sent descriptions say the agent verb is missing, not the capability.
       expect('a v1 or MCP Peppol send action is not yet available').not.toMatch(pattern)
     }
-    // No MCP tool or v1 action sends via Peppol yet: no text may hand an agent a Peppol send verb.
-    expect(allBodies).not.toMatch(/gnubok_send_invoice[^.\n]*Peppol/i)
-    expect(allBodies).not.toMatch(/gnubok_send_peppol|gnubok_peppol_send/i)
+    // The agent verb exists since the operation registry's wave 4: the texts name the right tool
+    // (gnubok_send_invoice_peppol), never an invented one.
+    expect(allBodies).not.toMatch(/gnubok_send_peppol\b|gnubok_peppol_send/i)
 
     const truthfulSkills = ['invoicing-rules', 'customer-onboarding'].map((slug) => {
       const skill = skills.find((candidate) => candidate.slug === slug)
@@ -217,19 +217,22 @@ describe('Skills registry', () => {
       // Where it lives, and that it is gated per company (with the English label for en-locale users).
       expect(text).toMatch(/invoice page in the dashboard/i)
       expect(text).toMatch(/(?:gated|access)[^.\n]*per company|per[- ]company[^.\n]*(?:access|gated)/i)
-      expect(text).toContain('Inställningar > Fakturering (Settings > Invoicing)')
+      expect(text).toContain('Inställningar > Kopplingar > E-faktura via Peppol (Settings > Connections > E-invoicing via Peppol)')
       expect(text).toMatch(/send cap/i)
       // The restrictions agents must not over-promise past (lib/invoices/peppol-bis-billing.ts).
-      expect(text).toMatch(/aktiebolag/i)
+      // Every legal form with an organisationsnummer sends; only enskild firma, whose org number
+      // is the owner's personnummer, waits for GLN (founder decision 2026-09-29).
+      expect(text).toMatch(/organisationsnummer/i)
       expect(text).toMatch(/enskild firma/i)
+      expect(text).not.toMatch(/aktiebolag senders|must be an aktiebolag/i)
       expect(text).toMatch(/standard invoices only|no credit notes/i)
       expect(text).toMatch(/SEK/)
       expect(text).toMatch(/6, 12 or 25 %/)
       expect(text).toMatch(/no reverse charge/i)
       expect(text).toMatch(/no ROT\/RUT deductions/i)
       expect(text).toMatch(/Er referens/)
-      // No agent-callable send verb yet.
-      expect(text).toMatch(/no MCP tool[^.\n]*Peppol|MCP tool[^.\n]*not (?:yet )?available/i)
+      // The agent-callable send verb, staged for a person to approve.
+      expect(text).toContain('gnubok_send_invoice_peppol')
       // A successful dashboard send issues the invoice; mark-sent is only the issuance-failure recovery.
       expect(text).toMatch(/successful dashboard Peppol send issues the invoice itself/i)
       expect(text).toMatch(/could not be marked as sent/i)
@@ -264,10 +267,10 @@ describe('Skills registry', () => {
       }
       // The pre-#546 framing listed Peppol as an external channel next to postal mail.
       expect(text).not.toMatch(/\(Peppol, postal/)
-      expect(text).toMatch(/a v1 or MCP Peppol send action is not yet available/)
+      expect(text).toMatch(/send-peppol/)
       expect(text).toMatch(/per-company access grant/)
-      expect(text).toContain('Inställningar > Fakturering (Settings > Invoicing)')
-      expect(text).toMatch(/aktiebolag senders, standard invoices only/)
+      expect(text).toContain('Inställningar > Kopplingar > E-faktura via Peppol (Settings > Connections > E-invoicing via Peppol)')
+      expect(text).toMatch(/senders whose org number is not a personnummer \(every legal form except enskild firma\), standard invoices only/)
       expect(text).toMatch(/buyers whose org number is not a personnummer/)
       expect(text).toMatch(/could not be marked as sent/)
     }
@@ -371,7 +374,7 @@ describe('gnubok_list_skills tool', () => {
 
   it('applicability filter hides AB-only skills for EF companies', async () => {
     const tool = tools.find((t) => t.name === 'gnubok_list_skills')!
-    const supabase = makeSupabaseWithEmptyAtomRegistry([], { entityType: 'EF', employeeCount: 0, vatRegistered: true })
+    const supabase = makeSupabaseWithEmptyAtomRegistry([], { entityType: 'enskild_firma', employeeCount: 0, vatRegistered: true })
     const result = (await tool.execute({}, 'company-1', 'user-1', supabase as never, { type: 'api_key' })) as {
       skills: Array<{ slug: string }>
       hidden_count: number
@@ -384,12 +387,33 @@ describe('gnubok_list_skills tool', () => {
     expect(slugs).toContain('invoicing-rules')
     expect(slugs).toContain('quarterly-vat-review') // vat_registered=true
     expect(result.hidden_count).toBeGreaterThan(0)
-    expect(result.company_context).toEqual({ entity_type: 'EF', has_employees: false, vat_registered: true })
+    expect(result.company_context).toEqual({ entity_type: 'enskild_firma', has_employees: false, vat_registered: true })
+  })
+
+  it.each([
+    ['aktiebolag', true],
+    ['enskild_firma', false],
+    ['ideell_forening', false],
+  ] as const)('shows the AB-only year-end close to %s: %s', async (entityType, shown) => {
+    const tool = tools.find((t) => t.name === 'gnubok_list_skills')!
+    const supabase = makeSupabaseWithEmptyAtomRegistry([], { entityType })
+    const result = (await tool.execute({}, 'company-1', 'user-1', supabase as never, { type: 'api_key' })) as {
+      skills: Array<{ slug: string }>
+      hidden_count: number
+      company_context: { entity_type: string | null }
+    }
+    const slugs = result.skills.map((s) => s.slug)
+    expect(slugs.includes('year-end-close')).toBe(shown)
+    // Skills tagged 'both' show for every form, a förening included.
+    expect(slugs).toContain('month-end-close')
+    expect(slugs).toContain('payroll-monthly')
+    expect(result.hidden_count).toBe(shown ? 0 : 1)
+    expect(result.company_context.entity_type).toBe(entityType)
   })
 
   it('include_all=true bypasses applicability filter', async () => {
     const tool = tools.find((t) => t.name === 'gnubok_list_skills')!
-    const supabase = makeSupabaseWithEmptyAtomRegistry([], { entityType: 'EF', employeeCount: 0, vatRegistered: false })
+    const supabase = makeSupabaseWithEmptyAtomRegistry([], { entityType: 'enskild_firma', employeeCount: 0, vatRegistered: false })
     const filtered = (await tool.execute({}, 'company-1', 'user-1', supabase as never, { type: 'api_key' })) as {
       count: number
       hidden_count: number
@@ -420,6 +444,23 @@ describe('gnubok_list_skills tool', () => {
     }
     expect(result.count).toBe(1)
     expect(result.skills[0].slug).toBe('vertical/konsult-it')
+  })
+
+  it('says whether each own item is a workflow, knowledge or an analysis, and marks Accounted analyses', async () => {
+    const tool = tools.find((t) => t.name === 'gnubok_list_skills')!
+    const own = (n: number, kind?: 'workflow' | 'rules' | 'analysis') => ({
+      id: `aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa${n}`, name: `Own ${n}`, description: 'd', body: 'Steps.', share_status: 'private',
+      atom_id: null, company_id: 'company-1', team_id: null, ...(kind ? { kind } : {}),
+    })
+    const supabase = makeSupabaseWithEmptyAtomRegistry([], {}, null, [own(1, 'workflow'), own(2, 'rules'), own(3, 'analysis'), own(4)])
+    const result = (await tool.execute({ include_all: true, __keyScopes: ['agent:read'] }, 'company-1', 'user-1', supabase as never, { type: 'api_key' })) as {
+      skills: Array<{ slug: string; tier: string; item_kind?: string }>
+    }
+    const kindOf = (slug: string) => result.skills.find((s) => s.slug === slug)?.item_kind
+    expect([1, 2, 3, 4].map((n) => kindOf(`own/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa${n}`))).toEqual(['workflow', 'rules', 'analysis', 'workflow'])
+    expect(kindOf('analys-kassaprognos')).toBe('analysis')
+    // A curated workflow has no kind to tell apart, so it carries none.
+    expect(result.skills.find((s) => s.slug === 'month-end-close')).not.toHaveProperty('item_kind')
   })
 })
 

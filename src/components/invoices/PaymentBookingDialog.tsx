@@ -27,6 +27,7 @@ import { useCompany } from '@/contexts/CompanyContext'
 import { Plus, Trash2 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { FormLine } from '@/components/bookkeeping/JournalEntryForm'
+import { withLineDimensions } from '@/components/bookkeeping/payment-line-dimensions'
 import type { EntityType } from '@/types'
 import type { InvoiceWithRelations } from '@/components/invoices/types'
 import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
@@ -172,7 +173,9 @@ export default function PaymentBookingDialog({
 
         const proposed = proposePaymentLines({
           invoice: {
+            id: invoice.id,
             invoice_number: invoice.invoice_number,
+            customer_name: invoice.customer?.name ?? null,
             total: invoice.total,
             total_sek: invoice.total_sek,
             subtotal: invoice.subtotal,
@@ -182,6 +185,8 @@ export default function PaymentBookingDialog({
             currency: invoice.currency,
             exchange_rate: invoice.exchange_rate,
             vat_treatment: invoice.vat_treatment,
+            // #2906: goods delivered abroad book 3108 / 3105, as on every other door.
+            delivery_country: invoice.delivery_country,
             items: invoice.items,
             default_dimensions: invoice.default_dimensions,
             ore_rounding: invoice.ore_rounding,
@@ -270,7 +275,9 @@ export default function PaymentBookingDialog({
   }
 
   const addLine = () => {
-    setLines((prev) => [...prev, { ...BLANK_LINE }])
+    // A row the user adds belongs to the same payment: it starts with the
+    // invoice's bag, like the proposed rows.
+    setLines((prev) => [...prev, { ...BLANK_LINE, ...withLineDimensions(invoice.default_dimensions) }])
   }
 
   const removeLine = (index: number) => {

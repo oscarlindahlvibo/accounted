@@ -53,10 +53,21 @@ export interface LegalFormProfile {
     closingName: string
     /** Account the prior year's result is moved to at the next year start; null when the form closes straight into equity. */
     priorYearCarry: string | null
+    /**
+     * Account earlier years' results are balanced to once the annual meeting
+     * has decided (balanserat resultat): AB 2091, förening 2067. An enskild
+     * firma keeps them on its equity account.
+     */
+    retained: string
     /** Whether someone owns the company (egna uttag, aktieägare). A förening has members, not owners. */
     hasOwners: boolean
     /** Money settled with the owner or member: EF 2013/2018, AB 2893, förening 2890. */
     settlement: { withdrawal: string; contribution: string }
+    /**
+     * Bound equity is member capital (medlemsinsatser 2083, förlagsinsatser
+     * 2084, ÅRL 3 kap. 10 b §) rather than aktiekapital 2081.
+     */
+    memberCapital: boolean
   }
   filings: {
     /** The income return the product prepares for the form; null when none is modelled. */
@@ -69,6 +80,10 @@ export interface LegalFormProfile {
     arsredovisning: boolean
     /** Frameworks the product offers the form. */
     frameworks: ReadonlyArray<'K1' | 'K2' | 'K3'>
+    /** Whether a Bolagsverket iXBRL taxonomy covers the form's årsredovisning (K2 AB only today). */
+    ixbrl: boolean
+    /** A revisor is required whatever the size (EFL 8 kap. 1 §); an AB may opt out below ABL 9 kap. 1 §. */
+    auditorAlwaysRequired: boolean
   }
   /**
    * Swedish nouns that differ by law, for labels that name the thing on its

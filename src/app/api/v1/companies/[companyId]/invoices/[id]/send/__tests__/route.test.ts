@@ -119,7 +119,6 @@ vi.mock('@/lib/email/invoice-templates', async (importOriginal) => ({
 vi.mock('@/lib/invoices/pdf-template', () => ({
   InvoicePDF: vi.fn().mockReturnValue({}),
   brandingFromCompanySettings: vi.fn().mockReturnValue({}),
-  SHOW_SWISH_ON_INVOICE: false,
 }))
 
 // The sandbox guard reads company_settings.is_sandbox at the top of the
@@ -153,6 +152,8 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
   // Records every .select() projection string per table so tests can assert
   // which columns the route actually fetches.
   const selects: Record<string, string[]> = {}
+  // Every .update() payload per table, in call order.
+  const updates: Record<string, unknown[]> = {}
   const buildChain = (table: string): unknown => {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
@@ -167,13 +168,16 @@ function makeFlexibleSupabase(byTable: Record<string, MockResult | MockResult[]>
           if (prop === 'select' && typeof args[0] === 'string') {
             ;(selects[table] ??= []).push(args[0])
           }
+          if (prop === 'update') {
+            ;(updates[table] ??= []).push(args[0])
+          }
           return buildChain(table)
         }
       },
     }
     return new Proxy({}, handler)
   }
-  return { from: vi.fn((table: string) => buildChain(table)), selects }
+  return { from: vi.fn((table: string) => buildChain(table)), selects, updates }
 }
 
 const COMPANY_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -408,6 +412,8 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
       'oversized additional_bcc',
       { additional_bcc: Array.from({ length: 21 }, (_, index) => `archive-${index}@example.test`) },
     ],
+    ['an email_subject over 200 characters', { email_subject: 'x'.repeat(201) }],
+    ['an email_body over 5000 characters', { email_body: 'x'.repeat(5001) }],
   ])('returns VALIDATION_ERROR for %s', async (_label, requestBody) => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
@@ -466,6 +472,11 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
     expect(body.data.journal_entry_id).toBe('jjjjjjjj-jjjj-4jjj-8jjj-jjjjjjjjjjjj')
     expect(res.headers.get('Cache-Control')).toBe('private, no-store')
     expect(mockSendEmail).toHaveBeenCalledTimes(1)
+    // Issued and booked BEFORE the email leaves.
+    const { createInvoiceJournalEntry } = await import('@/lib/bookkeeping/invoice-entries')
+    expect(vi.mocked(createInvoiceJournalEntry).mock.invocationCallOrder[0]).toBeLessThan(
+      mockSendEmail.mock.invocationCallOrder[0],
+    )
     expect(mockSendTrackedInvoiceEmail).toHaveBeenCalledWith(
       expect.objectContaining({ companyId: COMPANY_ID, invoiceId: INVOICE_ID }),
     )
@@ -480,6 +491,39 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
         ],
       }),
     )
+  })
+
+  it('writes the email with this send\'s own subject and message, without storing them', async () => {
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: [
+        { data: DRAFT_INVOICE, error: null },
+        { data: { invoice_number: '2026-0042' }, error: null },
+      ],
+      company_settings: { data: COMPANY_SETTINGS, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await sendInvoice(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send`,
+        { email_subject: 'Faktura {fakturanummer} för maj', email_body: 'Hej! Här kommer majfakturan.' },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const templates = await import('@/lib/email/invoice-templates')
+    const expectedData = expect.objectContaining({
+      overrides: { subject: 'Faktura {fakturanummer} för maj', body: 'Hej! Här kommer majfakturan.' },
+    })
+    expect(vi.mocked(templates.generateInvoiceEmailSubject)).toHaveBeenCalledWith(expectedData)
+    expect(vi.mocked(templates.generateInvoiceEmailHtml)).toHaveBeenCalledWith(expectedData)
+    expect(vi.mocked(templates.generateInvoiceEmailText)).toHaveBeenCalledWith(expectedData)
+    for (const payload of supabase.updates.invoices ?? []) {
+      expect(payload).not.toHaveProperty('email_subject')
+      expect(payload).not.toHaveProperty('email_body')
+    }
   })
 
   it('rejects custom recipients from a non-admin company member', async () => {
@@ -646,6 +690,30 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
     expect(body.error.code).toBe('INVOICE_SEND_NO_CUSTOMER_EMAIL')
   })
 
+  it('returns 409 INVOICE_CUSTOMER_MISSING when the customer was deleted (crm#263)', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: {
+          data: { ...DRAFT_INVOICE, customer_id: null, customer: null },
+          error: null,
+        },
+        company_settings: { data: COMPANY_SETTINGS, error: null },
+      }),
+    )
+
+    const res = await sendInvoice(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send`),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_CUSTOMER_MISSING')
+    expect(mockEnsureInvoiceNumber).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+  })
+
   it('rejects cancelled invoices with INVOICE_SEND_CANCELLED', async () => {
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
@@ -682,18 +750,55 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
     expect(body.error.code).toBe('INVOICE_UPDATE_NOT_DRAFT')
   })
 
-  it('returns 502 INVOICE_SEND_PROVIDER_FAILED when email send fails', async () => {
+  it('returns 502 INVOICE_SEND_ISSUED_NOT_DELIVERED when the email fails after the journal entry posted', async () => {
+    const { uploadDocument } = await import('@/lib/core/documents/document-service')
     mockSendEmail.mockResolvedValue({ success: false, error: 'rate_limited' })
-    mockServiceClient.mockReturnValue(
-      makeFlexibleSupabase({
-        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        invoices: [
-          { data: DRAFT_INVOICE, error: null },
-          { data: { invoice_number: '2026-0042' }, error: null },
-        ],
-        company_settings: { data: COMPANY_SETTINGS, error: null },
-      }),
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: [
+        { data: DRAFT_INVOICE, error: null },
+        { data: { invoice_number: '2026-0042' }, error: null },
+        { data: [{ id: INVOICE_ID }], error: null }, // issue: status flip draft -> sent
+        { data: null, error: null }, // journal_entry_id link
+      ],
+      company_settings: { data: COMPANY_SETTINGS, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await sendInvoice(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send`),
+      detailParams(COMPANY_ID, INVOICE_ID),
     )
+
+    // The verifikat is posted and never undone: the invoice stays issued,
+    // its PDF is archived as underlag, and the caller delivers it by hand.
+    expect(res.status).toBe(502)
+    const body = await res.json()
+    expect(body.error.code).toBe('INVOICE_SEND_ISSUED_NOT_DELIVERED')
+    expect(body.error.details.journal_entry_id).toBe('jjjjjjjj-jjjj-4jjj-8jjj-jjjjjjjjjjjj')
+    expect(supabase.updates.invoices).not.toContainEqual({ status: 'draft' })
+    expect(uploadDocument).toHaveBeenCalledWith(
+      expect.anything(),
+      USER_ID,
+      COMPANY_ID,
+      expect.objectContaining({ type: 'application/pdf' }),
+      expect.objectContaining({ journal_entry_id: 'jjjjjjjj-jjjj-4jjj-8jjj-jjjjjjjjjjjj' }),
+    )
+  })
+
+  it('returns 502 INVOICE_SEND_PROVIDER_FAILED with the draft restored when nothing was booked (kontantmetoden)', async () => {
+    mockSendEmail.mockResolvedValue({ success: false, error: 'rate_limited' })
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: [
+        { data: DRAFT_INVOICE, error: null },
+        { data: { invoice_number: '2026-0042' }, error: null },
+        { data: [{ id: INVOICE_ID }], error: null }, // issue: status flip draft -> sent
+        { data: [{ id: INVOICE_ID }], error: null }, // restore draft (nothing booked)
+      ],
+      company_settings: { data: { ...COMPANY_SETTINGS, accounting_method: 'cash' }, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
 
     const res = await sendInvoice(
       makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send`),
@@ -703,6 +808,41 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
     expect(res.status).toBe(502)
     const body = await res.json()
     expect(body.error.code).toBe('INVOICE_SEND_PROVIDER_FAILED')
+    expect(supabase.updates.invoices).toEqual([{ status: 'sent' }, { status: 'draft' }])
+  })
+
+  it('never emails an invoice whose journal entry the engine refuses: the engine error, the draft restored', async () => {
+    const { createInvoiceJournalEntry } = await import('@/lib/bookkeeping/invoice-entries')
+    const { MandatoryDimensionMissingError } = await import('@/lib/bookkeeping/dimension-errors')
+    vi.mocked(createInvoiceJournalEntry).mockRejectedValueOnce(
+      new MandatoryDimensionMissingError([
+        { account_number: '3001', sie_dim_no: '6', dimension_name: 'Projekt' },
+      ]),
+    )
+    const supabase = makeFlexibleSupabase({
+      company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+      invoices: [
+        { data: DRAFT_INVOICE, error: null },
+        { data: { invoice_number: '2026-0042' }, error: null },
+        { data: [{ id: INVOICE_ID }], error: null }, // issue: status flip draft -> sent
+        { data: [{ id: INVOICE_ID }], error: null }, // rollback to draft
+      ],
+      company_settings: { data: COMPANY_SETTINGS, error: null },
+    })
+    mockServiceClient.mockReturnValue(supabase)
+
+    const res = await sendInvoice(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/send`),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.code).toBe('MANDATORY_DIMENSION_MISSING')
+    expect(body.error.details.violations[0].account_number).toBe('3001')
+    expect(mockSendTrackedInvoiceEmail).not.toHaveBeenCalled()
+    expect(mockSendEmail).not.toHaveBeenCalled()
+    expect(supabase.updates.invoices).toEqual([{ status: 'sent' }, { status: 'draft' }])
   })
 
   it('dry-run validates the pipeline without sending email or allocating a number', async () => {
@@ -757,9 +897,9 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
     expect(body.error.details.field).toBe('credited_invoice_id')
   })
 
-  it('flags status flip 0-row no-op as a warning instead of lying in the response', async () => {
-    // Status flip returns no rows (concurrent state change). Email is gone;
-    // response status must say 'draft' and carry STATUS_UPDATE_FAILED.
+  it('a concurrent issuer (status flip matches 0 rows) stops the send before any email', async () => {
+    // The issue step runs before delivery: its compare-and-set is the
+    // single-winner lock, so the losing request neither books nor emails.
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
@@ -777,12 +917,10 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/send', () => {
       detailParams(COMPANY_ID, INVOICE_ID),
     )
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.data.status).toBe('draft')
-    expect(body.data.warnings).toEqual(
-      expect.arrayContaining([expect.objectContaining({ code: 'STATUS_UPDATE_FAILED' })]),
-    )
+    expect(body.error.code).toBe('INVOICE_UPDATE_NOT_DRAFT')
+    expect(mockSendEmail).not.toHaveBeenCalled()
   })
 
   it('renders the final PDF as if already sent (no UTKAST banner)', async () => {
