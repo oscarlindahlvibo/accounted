@@ -106,6 +106,7 @@ describe('invoice PDF deduction box: fakturamodellen', () => {
     const text = renderText(rutInvoice({}))
 
     expect(text).toContain('Säljaren begär utbetalningen från Skatteverket när köparen har betalat sin del (fakturamodellen).')
+    expect(text.replace(/\s+/g, ' ')).toContain('Som köpare blir du betalningsskyldig för icke godkänt belopp')
     expect(text).not.toContain('Köparen ansöker')
   })
 

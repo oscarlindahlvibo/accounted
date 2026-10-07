@@ -68,7 +68,7 @@ export const PDF_LABELS = {
     deductionLaborHours: 'Arbetstimmar:',
     // Fakturamodellen, ROT, RUT and grön teknik alike: the seller requests
     // the payout once the buyer has paid their share. The buyer never applies.
-    deductionPayoutNotice: 'Säljaren begär utbetalningen från Skatteverket när köparen har betalat sin del (fakturamodellen).',
+    deductionPayoutNotice: 'Säljaren begär utbetalningen från Skatteverket när köparen har betalat sin del (fakturamodellen). Som köpare blir du betalningsskyldig för icke godkänt belopp om Skatteverkets avslag beror på omständigheter som kan härledas till dig som köpare.',
     // Skattereduktion för grön teknik: Skatteverket asks the invoice to state
     // the total and the reduction incl. moms, what the installation cost
     // (arbete och material) apart from övriga kostnader, and the property
@@ -147,7 +147,7 @@ export const PDF_LABELS = {
     deductionApartmentNumber: 'Apartment number:',
     deductionWorkType: 'Service type:',
     deductionLaborHours: 'Labor hours:',
-    deductionPayoutNotice: 'The seller requests the payout from Skatteverket once the customer has paid their share (fakturamodellen).',
+    deductionPayoutNotice: 'The seller requests the payout from Skatteverket once the customer has paid their share (fakturamodellen). As the customer you are liable to pay any amount Skatteverket does not approve if the refusal is due to circumstances attributable to you as the customer.',
     deductionRowGronTeknik: 'Green technology tax reduction:',
     totalInclVat: 'Total incl. VAT:',
     deductionBrfOrgNumber: 'Housing cooperative org. no.:',
