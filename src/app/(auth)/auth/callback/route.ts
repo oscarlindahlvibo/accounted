@@ -5,6 +5,7 @@ import { INVITE_COOKIE_NAME } from '@/lib/auth/consume-invite-cookie'
 import { safeReturnTo } from '@/lib/auth/safe-return-to'
 import { resolveLandingDestination } from '@/lib/company/landing-server'
 import { acceptPendingTeamInviteByToken } from '@/lib/company/pending-invites'
+import { resolveRequestAppOrigin } from '@/lib/domains/trusted-app-origin'
 
 /**
  * The one `next` destination this callback honours for a fresh session: the
@@ -169,7 +170,12 @@ async function resolveStockEmailChangeStatus(
 }
 
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url)
+  const { searchParams } = new URL(request.url)
+  // Not request.url's origin: behind a reverse proxy the standalone server
+  // reports its own bind address (http://0.0.0.0:3000), which sent confirmed
+  // users to an unreachable host. Resolve the public origin like every other
+  // auth link does (canonical app URL or a registered brand host).
+  const origin = await resolveRequestAppOrigin(request)
   const code = searchParams.get('code')
   const token_hash = searchParams.get('token_hash')
   const type = searchParams.get('type')
