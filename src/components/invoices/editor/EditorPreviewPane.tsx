@@ -14,6 +14,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { PdfPageImages } from './PdfPageImages'
 import type { PdfPreviewState } from './use-editor-previews'
 
 type PreviewTab = 'document' | 'email'
@@ -76,6 +77,23 @@ export function EditorPreviewPane({
   // the pane back to the document.
   const tab: PreviewTab = emailDisabledReason ? 'document' : chosenTab
   const [zoom, setZoom] = useState<Zoom>('page')
+  // Page images instead of an inline PDF viewer: on by default where the browser
+  // reports no PDF viewer (or runs as an installed web app); the choice sticks.
+  const [asImages, setAsImages] = useState(false)
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem('invoice-preview-images')
+      if (saved !== null) { setAsImages(saved === '1'); return }
+    } catch { /* storage blocked */ }
+    const standalone = window.matchMedia?.('(display-mode: standalone)').matches
+      || (navigator as Navigator & { standalone?: boolean }).standalone === true
+    setAsImages(navigator.pdfViewerEnabled === false || standalone)
+  }, [])
+  function toggleImages() {
+    const next = !asImages
+    setAsImages(next)
+    try { window.localStorage.setItem('invoice-preview-images', next ? '1' : '0') } catch { /* storage blocked */ }
+  }
 
   // Double-buffered: a new render loads in a hidden <object> over the shown
   // one and swaps in once it has painted, so an edit never blanks the page.
@@ -116,6 +134,13 @@ export function EditorPreviewPane({
                 </a>
               </Button>
             )}
+            <button
+              type="button"
+              onClick={toggleImages}
+              className="inline-flex h-8 items-center rounded-full px-3 text-[12.5px] text-muted-foreground transition-colors duration-150 hover:text-foreground"
+            >
+              {asImages ? 'Visa som PDF' : 'Visa som bilder'}
+            </button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
@@ -146,7 +171,9 @@ export function EditorPreviewPane({
             )}
             aria-busy={pdf.loading}
           >
-            {visible ? (
+            {visible && asImages ? (
+              <PdfPageImages url={visible} />
+            ) : visible ? (
               // <object type="application/pdf">, not an <iframe>: Chrome's
               // frame pipeline intermittently blocked the PDF (see
               // InvoicePreviewCard).
