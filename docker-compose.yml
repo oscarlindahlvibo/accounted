@@ -41,7 +41,7 @@ services:
       - /app/public:uid=1001,gid=1001,mode=750,size=200m
     # CPU limits are intentionally left to host tooling or a local override.
     # Some Compose builds bundled with NAS platforms reject the `cpus` key.
-    mem_limit: 1g
+    mem_limit: 4g
     pids_limit: 200
     restart: unless-stopped
     healthcheck:
