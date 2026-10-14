@@ -153,6 +153,25 @@ export function isSmtpConfigured(): boolean {
 
 let cachedTransport: { key: string; transport: Transporter } | null = null
 
+/**
+ * Vibo fork: a dedicated SMTP login for one From address. Gmail only sends as
+ * the logged-in user (or a send-as alias), so a company mailbox in the same
+ * Workspace needs its own login. INVOICE_SMTP_ACCOUNTS =
+ * {"faktura@domain": {"pass": "app password", "user": "optional, defaults to the address"}}.
+ */
+export function smtpAccountFor(fromAddress: string | undefined, base: SmtpSettings): SmtpSettings | null {
+  const raw = process.env.INVOICE_SMTP_ACCOUNTS
+  const key = fromAddress?.trim().toLowerCase()
+  if (!raw || !key) return null
+  try {
+    const entry = (JSON.parse(raw) as Record<string, { user?: string; pass?: string } | undefined>)[key]
+    if (!entry?.pass) return null
+    return { ...base, user: entry.user?.trim() || key, pass: entry.pass }
+  } catch {
+    return null
+  }
+}
+
 function getTransport(settings: SmtpSettings): Transporter {
   const key = JSON.stringify({ ...settings, pass: settings.pass ? 'set' : 'unset' })
   if (cachedTransport && cachedTransport.key === key) return cachedTransport.transport
@@ -207,7 +226,8 @@ export class SmtpEmailService implements EmailService {
     }
 
     try {
-      const transport = getTransport(settings)
+      const accountSettings = smtpAccountFor(options.from?.address, settings)
+      const transport = getTransport(accountSettings ?? settings)
       let info: { messageId?: string }
       try {
         info = await transport.sendMail({ from, ...mail })
@@ -222,7 +242,7 @@ export class SmtpEmailService implements EmailService {
           from,
           error: error instanceof Error ? error.message : String(error),
         })
-        info = await transport.sendMail({ from: platformFrom, ...mail })
+        info = await getTransport(settings).sendMail({ from: platformFrom, ...mail })
       }
       return { success: true, provider: 'smtp', messageId: info.messageId }
     } catch (error) {
