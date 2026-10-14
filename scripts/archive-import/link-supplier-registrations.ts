@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js'
 import { config } from 'dotenv'
 config({ path: '.env' })
 const sb = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } })
-const C = 'cde8db5b-da1b-4b75-ad48-ce1a2d9de1c3'; const APPLY = process.argv.includes('--apply')
+const ci = process.argv.indexOf('--company'); const C = ci >= 0 ? process.argv[ci + 1] : ''; if (!/^[0-9a-f-]{36}$/i.test(C)) { console.error('Usage: --company <uuid> [--apply]'); process.exit(1) }; const APPLY = process.argv.includes('--apply')
 const r2 = (n: number) => Math.round(n * 100) / 100
 async function all(table: string, sel: string, f: (q: any) => any) { const out: any[] = []; for (let o = 0; ; o += 1000) { const { data, error } = await f(sb.from(table).select(sel)).range(o, o + 999); if (error) throw error; out.push(...data); if (data.length < 1000) break } return out }
 async function main() {
