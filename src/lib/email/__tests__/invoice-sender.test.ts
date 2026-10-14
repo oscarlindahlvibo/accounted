@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
   buildSenderAddress,
   senderFromRow,
+  senderFromOverrides,
   resolveInvoiceSender,
 } from '@/lib/email/invoice-sender'
 import { createQueuedMockSupabase } from '@/tests/helpers'
@@ -111,5 +112,21 @@ describe('resolveInvoiceSender', () => {
     await expect(
       resolveInvoiceSender(second.supabase as unknown as SupabaseClient, 'company-1', 'X'),
     ).resolves.toBeUndefined()
+  })
+})
+
+
+describe('senderFromOverrides', () => {
+  const raw = JSON.stringify({ 'co-1': { address: 'Faktura@Vibogruppen.se' }, 'co-2': { address: 'bad', name: 'X' } })
+
+  it('returns the configured address lowercased with the company name', () => {
+    expect(senderFromOverrides(raw, 'co-1', 'Vibogruppen AB')).toEqual({ name: 'Vibogruppen AB', address: 'faktura@vibogruppen.se' })
+  })
+
+  it('ignores other companies, bad addresses, empty and malformed input', () => {
+    expect(senderFromOverrides(raw, 'co-3', 'Other AB')).toBeUndefined()
+    expect(senderFromOverrides(raw, 'co-2', 'X AB')).toBeUndefined()
+    expect(senderFromOverrides(undefined, 'co-1', 'A')).toBeUndefined()
+    expect(senderFromOverrides('{not json', 'co-1', 'A')).toBeUndefined()
   })
 })

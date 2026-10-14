@@ -45,6 +45,34 @@ export function senderFromRow(
   return { name, address: buildSenderAddress(row.sender_local_part, row.domain) }
 }
 
+const OVERRIDE_ADDRESS_PATTERN = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/
+
+/**
+ * Vibo fork: a fixed From address per company on the platform's SMTP account,
+ * for companies whose own mailbox is registered in the same Google Workspace.
+ * INVOICE_SENDER_OVERRIDES = {"COMPANY_ID": {"address": "faktura@domain", "name": "optional"}}.
+ * The display name defaults to the company name. Anything malformed is ignored
+ * (platform sender), and a reserved platform domain is refused like a tampered row.
+ */
+export function senderFromOverrides(
+  raw: string | undefined,
+  companyId: string,
+  companyName: string | null | undefined,
+): InvoiceSenderIdentity | undefined {
+  if (!raw) return undefined
+  try {
+    const entry = (JSON.parse(raw) as Record<string, { address?: string; name?: string } | undefined>)[companyId]
+    const address = entry?.address?.trim().toLowerCase()
+    if (!address || !OVERRIDE_ADDRESS_PATTERN.test(address)) return undefined
+    const domain = address.split('@')[1]
+    if (!isValidHostname(domain) || isReservedSenderDomain(domain)) return undefined
+    const name = (entry?.name ?? companyName ?? '').trim()
+    return name ? { name, address } : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Resolve the From identity for a company's invoice email.
  *
@@ -62,6 +90,8 @@ export async function resolveInvoiceSender(
   companyId: string,
   companyName: string | null | undefined,
 ): Promise<InvoiceSenderIdentity | undefined> {
+  const override = senderFromOverrides(process.env.INVOICE_SENDER_OVERRIDES, companyId, companyName)
+  if (override) return override
   try {
     const { data, error } = await supabase
       .from('company_sending_domains')
